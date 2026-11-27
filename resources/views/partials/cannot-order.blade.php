@@ -1,0 +1,1 @@
+<div class="ef-alert ef-alert--warn">Potrai ordinare appena la tua anagrafica sarà completa: se ne occupa il tuo agente di riferimento{{ isset($dealer) && $dealer->agent ? ' ('.$dealer->agent->user->name.')' : '' }}.</div>

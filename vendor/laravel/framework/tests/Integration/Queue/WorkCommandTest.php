@@ -1,0 +1,425 @@
+<?php
+
+namespace Illuminate\Tests\Integration\Queue;
+
+use Illuminate\Bus\Queueable;
+use Illuminate\Cache\Repository;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Foundation\Testing\DatabaseMigrations;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Worker;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Exceptions;
+use Illuminate\Support\Facades\Queue;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use Orchestra\Testbench\Attributes\WithMigration;
+use RuntimeException;
+
+#[WithMigration]
+#[WithMigration('queue')]
+class WorkCommandTest extends QueueTestCase
+{
+    use DatabaseMigrations;
+    use VerifiesDoubles;
+
+    protected function setUp(): void
+    {
+        $this->beforeApplicationDestroyed(function () {
+            FirstJob::$ran = false;
+            SecondJob::$ran = false;
+            ThirdJob::$ran = false;
+            Worker::$flushStickyConnections = false;
+        });
+
+        parent::setUp();
+
+        $this->markTestSkippedWhenUsingSyncQueueDriver();
+    }
+
+    public function testRunningOneJob()
+    {
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--once' => true,
+            '--memory' => 1024,
+        ])->assertExitCode(0);
+
+        $this->assertSame(1, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+        $this->assertFalse(SecondJob::$ran);
+    }
+
+    public function testRunTimestampOutputWithDefaultAppTimezone()
+    {
+        // queue.output_timezone not set at all
+        $this->travelTo(Carbon::create(2023, 1, 18, 10, 10, 11));
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--once' => true,
+            '--memory' => 1024,
+        ])->expectsOutputToContain('2023-01-18 10:10:11')
+            ->assertExitCode(0);
+    }
+
+    public function testRunTimestampOutputWithDifferentLogTimezone()
+    {
+        $this->app['config']->set('queue.output_timezone', 'Europe/Helsinki');
+
+        $this->travelTo(Carbon::create(2023, 1, 18, 10, 10, 11));
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--once' => true,
+            '--memory' => 1024,
+        ])->expectsOutputToContain('2023-01-18 12:10:11')
+            ->assertExitCode(0);
+    }
+
+    public function testRunTimestampOutputWithSameAppDefaultAndQueueLogDefault()
+    {
+        $this->app['config']->set('queue.output_timezone', 'UTC');
+
+        $this->travelTo(Carbon::create(2023, 1, 18, 10, 10, 11));
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--once' => true,
+            '--memory' => 1024,
+        ])->expectsOutputToContain('2023-01-18 10:10:11')
+            ->assertExitCode(0);
+    }
+
+    public function testDaemon()
+    {
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--memory' => 1024,
+        ])->assertExitCode(0);
+
+        $this->assertSame(0, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+        $this->assertTrue(SecondJob::$ran);
+    }
+
+    public function testWorkerDoesNotFlushStickyConnectionsByDefault()
+    {
+        Queue::push(new WritingJob);
+
+        $this->artisan('queue:work', [
+            '--stop-when-empty' => true,
+            '--memory' => 1024,
+        ])->assertExitCode(0);
+
+        $this->assertTrue(DB::connection()->hasModifiedRecords());
+    }
+
+    public function testWorkerCanFlushStickyConnections()
+    {
+        Worker::$flushStickyConnections = true;
+
+        Queue::push(new WritingJob);
+
+        $this->artisan('queue:work', [
+            '--stop-when-empty' => true,
+            '--memory' => 1024,
+        ])->assertExitCode(0);
+
+        $this->assertFalse(DB::connection()->hasModifiedRecords());
+    }
+
+    public function testMemoryExceeded()
+    {
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--memory' => 1,
+        ])->assertExitCode(12);
+
+        // Memory limit isn't checked until after the first job is attempted.
+        $this->assertSame(1, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+        $this->assertFalse(SecondJob::$ran);
+    }
+
+    public function testMaxJobsExceeded()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--max-jobs' => 1,
+        ]);
+
+        // Memory limit isn't checked until after the first job is attempted.
+        $this->assertSame(1, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+        $this->assertFalse(SecondJob::$ran);
+    }
+
+    public function testMaxTimeExceeded()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Queue::push(new ThirdJob);
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--max-time' => 1,
+        ]);
+
+        // Memory limit isn't checked until after the first job is attempted.
+        $this->assertSame(2, Queue::size());
+        $this->assertTrue(ThirdJob::$ran);
+        $this->assertFalse(FirstJob::$ran);
+        $this->assertFalse(SecondJob::$ran);
+    }
+
+    public function testMemoryExitCode()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Worker::$memoryExceededExitCode = 0;
+
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--memory' => 1,
+        ])->assertExitCode(0);
+
+        // Memory limit isn't checked until after the first job is attempted.
+        $this->assertSame(1, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+        $this->assertFalse(SecondJob::$ran);
+
+        Worker::$memoryExceededExitCode = null;
+    }
+
+    public function testDisableLastRestartCheck()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Worker::$restartable = false;
+
+        $cache = Double::for(Repository::class);
+        $cache->expects('get')->with('illuminate:queue:restart')->never();
+        $cache->expects('get')->with('illuminate:queues:paused')->returns(null);
+        $cache->expects('many')->returns([]);
+
+        Cache::expects('driver')->times(2)->andReturn($cache);
+        Cache::expects('store')->andReturn($cache);
+
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--max-jobs' => 1,
+            '--stop-when-empty' => true,
+        ]);
+
+        $this->assertSame(0, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+
+        Worker::$restartable = true;
+    }
+
+    public function testDisablePauseQueueCheck()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Worker::$pausable = false;
+
+        $cache = Double::for(Repository::class);
+
+        $cache->expects('get')->times(2)->with('illuminate:queue:restart')->returns(null);
+        $cache->expects('many')->never();
+
+        Cache::expects('driver')->times(2)->andReturn($cache);
+        Cache::shouldNotReceive('store');
+
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--max-jobs' => 1,
+            '--stop-when-empty' => true,
+        ]);
+
+        $this->assertSame(0, Queue::size());
+        $this->assertTrue(FirstJob::$ran);
+
+        Worker::$pausable = true;
+    }
+
+    public function testFailedJobListenerOnlyRunsOnce()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['redis', 'beanstalkd']);
+
+        Exceptions::fake();
+
+        Queue::push(new FirstJob);
+        $this->withoutMockingConsoleOutput()->artisan('queue:work', ['--once' => true, '--sleep' => 0]);
+
+        Queue::push(new JobWillFail);
+        $this->withoutMockingConsoleOutput()->artisan('queue:work', ['--once' => true]);
+        Exceptions::assertNotReported(UniqueConstraintViolationException::class);
+        $this->assertSame(2, substr_count(Artisan::output(), JobWillFail::class));
+    }
+
+    public function testReleasedJobIsWrittenAsReleased()
+    {
+        $this->markTestSkippedWhenUsingQueueDrivers(['beanstalkd']);
+
+        Queue::push(new ReleasingJob);
+
+        $this->artisan('queue:work', [
+            '--once' => true,
+            '--memory' => 1024,
+        ])->expectsOutputToContain('RELEASED')
+            ->doesntExpectOutputToContain('DONE')
+            ->assertExitCode(0);
+    }
+
+    public function testStopReasonIsWritten()
+    {
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--memory' => 1024,
+        ])->expectsOutputToContain('Queue empty')
+            ->assertExitCode(0);
+    }
+
+    public function testStopReasonIsWrittenAsJson()
+    {
+        Queue::push(new FirstJob);
+        Queue::push(new SecondJob);
+
+        $connection = config('queue.default');
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--memory' => 1,
+            '--queue' => 'high,default',
+            '--json' => true,
+        ])->expectsOutputToContain('"connection":"'.$connection.'","queue":"high,default","status":"stopped","reason":"memory","exit_code":12')
+            ->assertExitCode(12);
+    }
+
+    public function testPausedQueueStatusIsWrittenAsJson()
+    {
+        $connection = config('queue.default');
+
+        Queue::pause($connection, 'high');
+
+        Queue::push(new FirstJob);
+
+        $this->artisan('queue:work', [
+            '--daemon' => true,
+            '--stop-when-empty' => true,
+            '--memory' => 1024,
+            '--queue' => 'high,default',
+            '--json' => true,
+        ])->expectsOutputToContain('"connection":"'.$connection.'","queue":"high","status":"paused"')
+            ->assertExitCode(0);
+
+        $this->assertTrue(FirstJob::$ran);
+    }
+}
+
+class FirstJob implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    public static $ran = false;
+
+    public function handle()
+    {
+        static::$ran = true;
+    }
+}
+
+class SecondJob implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    public static $ran = false;
+
+    public function handle()
+    {
+        static::$ran = true;
+    }
+}
+
+class ThirdJob implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    public static $ran = false;
+
+    public function handle()
+    {
+        sleep(1);
+
+        static::$ran = true;
+    }
+}
+
+class WritingJob implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    public function handle()
+    {
+        DB::table('users')->insert([
+            'name' => 'BigT',
+            'email' => 'bigt@laravel.com',
+            'password' => 'secret',
+        ]);
+    }
+}
+
+class ReleasingJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable;
+
+    public function handle()
+    {
+        $this->release(30);
+    }
+}
+
+class JobWillFail implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    public function handle()
+    {
+        throw new RuntimeException;
+    }
+}

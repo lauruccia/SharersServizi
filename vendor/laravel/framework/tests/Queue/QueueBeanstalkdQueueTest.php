@@ -1,0 +1,167 @@
+<?php
+
+namespace Illuminate\Tests\Queue;
+
+use Illuminate\Container\Container;
+use Illuminate\Queue\Attributes\Delay;
+use Illuminate\Queue\BeanstalkdQueue;
+use Illuminate\Queue\Jobs\BeanstalkdJob;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
+use JMac\Testing\Double;
+use JMac\Testing\DoubleInterface;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use JMac\Testing\Matching\Argument;
+use Pheanstalk\Contract\JobIdInterface;
+use Pheanstalk\Contract\PheanstalkManagerInterface;
+use Pheanstalk\Contract\PheanstalkPublisherInterface;
+use Pheanstalk\Contract\PheanstalkSubscriberInterface;
+use Pheanstalk\Pheanstalk;
+use Pheanstalk\Values\Job;
+use Pheanstalk\Values\TubeList;
+use Pheanstalk\Values\TubeName;
+use PHPUnit\Framework\TestCase;
+
+class QueueBeanstalkdQueueTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    /**
+     * @var \Illuminate\Queue\BeanstalkdQueue
+     */
+    private $queue;
+
+    /**
+     * @var \Illuminate\Container\Container|DoubleInterface
+     */
+    private $container;
+
+    public function testPushProperlyPushesJobOntoBeanstalkd()
+    {
+        $uuid = Str::uuid();
+
+        $time = Carbon::now();
+        Carbon::setTestNow($time);
+
+        Str::createUuidsUsing(function () use ($uuid) {
+            return $uuid;
+        });
+
+        $this->setQueue('default', 60);
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('useTube')->times(2)->with(Argument::type(TubeName::class));
+        $pheanstalk->expects('put')->times(2)->with(json_encode(['uuid' => $uuid, 'displayName' => 'foo', 'job' => 'foo', 'maxTries' => null, 'maxExceptions' => null, 'failOnTimeout' => false, 'backoff' => null, 'timeout' => null, 'data' => ['data'], 'createdAt' => $time->getTimestamp(), 'delay' => null]), 1024, 0, 60);
+
+        $this->queue->push('foo', ['data'], 'stack');
+        $this->queue->push('foo', ['data']);
+
+        $this->container->received('bound')->with('events')->times(4);
+
+        Str::createUuidsNormally();
+    }
+
+    public function testDelayedPushProperlyPushesJobOntoBeanstalkd()
+    {
+        $uuid = Str::uuid();
+
+        Str::createUuidsUsing(function () use ($uuid) {
+            return $uuid;
+        });
+
+        $time = Carbon::now();
+        Carbon::setTestNow($time);
+
+        $this->setQueue('default', 60);
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('useTube')->times(2)->with(Argument::type(TubeName::class));
+        $pheanstalk->expects('put')->times(2)->with(json_encode(['uuid' => $uuid, 'displayName' => 'foo', 'job' => 'foo', 'maxTries' => null, 'maxExceptions' => null, 'failOnTimeout' => false, 'backoff' => null, 'timeout' => null, 'data' => ['data'], 'createdAt' => $time->getTimestamp(), 'delay' => 5]), Pheanstalk::DEFAULT_PRIORITY, 5, Pheanstalk::DEFAULT_TTR);
+
+        $this->queue->later(5, 'foo', ['data'], 'stack');
+        $this->queue->later(5, 'foo', ['data']);
+
+        $this->container->received('bound')->with('events')->times(4);
+
+        Str::createUuidsNormally();
+    }
+
+    public function testBulkRespectsDelayAttributeWhenPushingOntoBeanstalkd()
+    {
+        $this->setQueue('default', 60);
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('useTube')->with(Argument::type(TubeName::class));
+        $pheanstalk->expects('put')->with(Argument::type('string'), Pheanstalk::DEFAULT_PRIORITY, 15, Pheanstalk::DEFAULT_TTR);
+
+        $this->queue->bulk([new BeanstalkdJobWithDelayAttribute], ['data']);
+    }
+
+    public function testPopProperlyPopsJobOffOfBeanstalkd()
+    {
+        $this->setQueue('default', 60);
+        $tube = new TubeName('default');
+
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('watch')->with(Argument::type(TubeName::class));
+        $pheanstalk->expects('listTubesWatched')->returns(new TubeList($tube));
+
+        $jobId = Double::for(JobIdInterface::class);
+        $jobId->expects('getId');
+        $job = new Job($jobId, '');
+        $pheanstalk->expects('reserveWithTimeout')->with(0)->returns($job);
+
+        $result = $this->queue->pop();
+
+        $this->assertInstanceOf(BeanstalkdJob::class, $result);
+    }
+
+    public function testBlockingPopProperlyPopsJobOffOfBeanstalkd()
+    {
+        $this->setQueue('default', 60, 60);
+        $tube = new TubeName('default');
+
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('watch')->with(Argument::type(TubeName::class));
+        $pheanstalk->expects('listTubesWatched')->returns(new TubeList($tube));
+
+        $jobId = Double::for(JobIdInterface::class);
+        $jobId->expects('getId');
+        $job = new Job($jobId, '');
+        $pheanstalk->expects('reserveWithTimeout')->with(60)->returns($job);
+
+        $result = $this->queue->pop();
+
+        $this->assertInstanceOf(BeanstalkdJob::class, $result);
+    }
+
+    public function testDeleteProperlyRemoveJobsOffBeanstalkd()
+    {
+        $this->setQueue('default', 60);
+
+        $pheanstalk = $this->queue->getPheanstalk();
+        $pheanstalk->expects('useTube')->with(Argument::type(TubeName::class))->returns($pheanstalk);
+        $pheanstalk->expects('delete')->with(Argument::type(JobIdInterface::class));
+
+        $this->queue->deleteMessage('default', 1);
+    }
+
+    /**
+     * @param  string  $default
+     * @param  int  $timeToRun
+     * @param  int  $blockFor
+     */
+    private function setQueue($default, $timeToRun, $blockFor = 0)
+    {
+        $this->queue = new BeanstalkdQueue(
+            Double::for(PheanstalkManagerInterface::class, PheanstalkPublisherInterface::class, PheanstalkSubscriberInterface::class),
+            $default,
+            $timeToRun,
+            $blockFor
+        );
+        $this->container = Double::for(Container::class, override: true);
+        $this->queue->setContainer($this->container->instance());
+    }
+}
+
+#[Delay(15)]
+class BeanstalkdJobWithDelayAttribute
+{
+}

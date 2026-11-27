@@ -1,0 +1,229 @@
+<?php
+
+namespace Illuminate\Tests\View;
+
+use ErrorException;
+use Exception;
+use Illuminate\Contracts\Filesystem\FileNotFoundException;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\View\Compilers\CompilerInterface;
+use Illuminate\View\Engines\CompilerEngine;
+use Illuminate\View\ViewException;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+
+class ViewCompilerEngineTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    public function testViewsMayBeRecompiledAndRendered()
+    {
+        $engine = $this->getEngine();
+        $engine->getCompiler()->expects('getCompiledPath')->with(__DIR__.'/Fixtures/foo.php')->returns(__DIR__.'/Fixtures/basic.php');
+        $engine->getCompiler()->expects('isExpired')->with(__DIR__.'/Fixtures/foo.php')->returns(true);
+        $engine->getCompiler()->expects('compile')->with(__DIR__.'/Fixtures/foo.php');
+        $results = $engine->get(__DIR__.'/Fixtures/foo.php');
+
+        $this->assertSame('Hello World
+', $results);
+    }
+
+    public function testViewsAreNotRecompiledIfTheyAreNotExpired()
+    {
+        $engine = $this->getEngine();
+        $engine->getCompiler()->expects('getCompiledPath')->with(__DIR__.'/Fixtures/foo.php')->returns(__DIR__.'/Fixtures/basic.php');
+        $engine->getCompiler()->expects('isExpired')->returns(false);
+        $engine->getCompiler()->expects('compile')->never();
+        $results = $engine->get(__DIR__.'/Fixtures/foo.php');
+
+        $this->assertSame('Hello World
+', $results);
+    }
+
+    public function testRegularExceptionsAreReThrownAsViewExceptions()
+    {
+        $engine = $this->getEngine();
+        $engine->getCompiler()->expects('getCompiledPath')->with(__DIR__.'/Fixtures/foo.php')->returns(__DIR__.'/Fixtures/regular-exception.php');
+        $engine->getCompiler()->expects('isExpired')->returns(false);
+
+        $this->expectExceptionObject(new ViewException('regular exception message'));
+
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+    }
+
+    public function testHttpExceptionsAreNotReThrownAsViewExceptions()
+    {
+        $engine = $this->getEngine();
+        $engine->getCompiler()->expects('getCompiledPath')->with(__DIR__.'/Fixtures/foo.php')->returns(__DIR__.'/Fixtures/http-exception.php');
+        $engine->getCompiler()->expects('isExpired')->returns(false);
+
+        $this->expectExceptionObject(new HttpException(403, 'http exception message'));
+
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+    }
+
+    public function testThatViewsAreNotAskTwiceIfTheyAreExpired()
+    {
+        $engine = $this->getEngine();
+        $engine->getCompiler()->expects('getCompiledPath')->times(4)->with(__DIR__.'/Fixtures/foo.php')->returns(__DIR__.'/Fixtures/basic.php');
+        $engine->getCompiler()->expects('isExpired')->times(2)->returns(false);
+        $engine->getCompiler()->expects('compile')->never();
+
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+
+        $engine->forgetCompiledOrNotExpired();
+
+        $engine->get(__DIR__.'/Fixtures/foo.php');
+    }
+
+    public function testViewsAreRecompiledWhenCompiledViewIsMissingViaFileNotFoundException()
+    {
+        $compiled = __DIR__.'/Fixtures/basic.php';
+        $path = __DIR__.'/Fixtures/foo.php';
+
+        $files = Double::for(Filesystem::class);
+        $engine = $this->getEngine($files);
+
+        $calls = 0;
+        $files->expects('getRequire')->with($compiled, [])->times(3)->resolves(function () use (&$calls, $path) {
+            if (++$calls === 2) {
+                throw new FileNotFoundException(
+                    "File does not exist at path {$path}."
+                );
+            }
+
+            return 'compiled-content';
+        });
+
+        $engine->getCompiler()->expects('getCompiledPath')->times(3)->with($path)->returns($compiled);
+
+        $engine->getCompiler()->expects('isExpired')->returns(true);
+
+        $engine->getCompiler()
+            ->expects('compile')
+            ->times(2)
+            ->with($path);
+
+        $engine->get($path);
+        $engine->get($path);
+    }
+
+    public function testViewsAreRecompiledWhenCompiledViewIsMissingViaRequireException()
+    {
+        $compiled = __DIR__.'/Fixtures/basic.php';
+        $path = __DIR__.'/Fixtures/foo.php';
+
+        $files = Double::for(Filesystem::class);
+        $engine = $this->getEngine($files);
+
+        $calls = 0;
+        $files->expects('getRequire')->with($compiled, [])->times(3)->resolves(function () use (&$calls, $path) {
+            if (++$calls === 2) {
+                throw new ErrorException(
+                    "require({$path}): Failed to open stream: No such file or directory",
+                );
+            }
+
+            return 'compiled-content';
+        });
+
+        $engine->getCompiler()->expects('getCompiledPath')->times(3)->with($path)->returns($compiled);
+
+        $engine->getCompiler()->expects('isExpired')->returns(true);
+
+        $engine->getCompiler()
+            ->expects('compile')
+            ->times(2)
+            ->with($path);
+
+        $engine->get($path);
+        $engine->get($path);
+    }
+
+    public function testViewsAreRecompiledJustOnceWhenCompiledViewIsMissing()
+    {
+        $compiled = __DIR__.'/Fixtures/basic.php';
+        $path = __DIR__.'/Fixtures/foo.php';
+
+        $files = Double::for(Filesystem::class);
+        $engine = $this->getEngine($files);
+
+        $requires = 0;
+        $files->expects('getRequire')->times(3)->with($compiled, [])->resolves(function () use (&$requires, $path) {
+            if ($requires++ === 0) {
+                return 'compiled-content';
+            }
+
+            throw new FileNotFoundException("File does not exist at path {$path}.");
+        });
+
+        $engine->getCompiler()->expects('getCompiledPath')->times(3)->with($path)->returns($compiled);
+
+        $engine->getCompiler()->expects('isExpired')->returns(true);
+
+        $engine->getCompiler()
+            ->expects('compile')
+            ->times(2)
+            ->with($path);
+
+        $engine->get($path);
+
+        $this->expectExceptionObject(new ViewException("File does not exist at path {$path}."));
+        $engine->get($path);
+    }
+
+    public function testViewsAreNotRecompiledOnRegularViewException()
+    {
+        $compiled = __DIR__.'/Fixtures/basic.php';
+        $path = __DIR__.'/Fixtures/foo.php';
+
+        $files = Double::for(Filesystem::class);
+        $engine = $this->getEngine($files);
+
+        $files->expects('getRequire')->with($compiled, [])->throws(new Exception(
+            'Just an regular error...'
+        ));
+
+        $engine->getCompiler()->expects('isExpired')->returns(false);
+
+        $engine->getCompiler()->expects('compile')->never();
+
+        $engine->getCompiler()->expects('getCompiledPath')->with($path)->returns($compiled);
+
+        $this->expectExceptionObject(new ViewException('Just an regular error...'));
+        $engine->get($path);
+    }
+
+    public function testViewsAreNotRecompiledIfTheyWereJustCompiled()
+    {
+        $compiled = __DIR__.'/Fixtures/basic.php';
+        $path = __DIR__.'/Fixtures/foo.php';
+
+        $files = Double::for(Filesystem::class);
+        $engine = $this->getEngine($files);
+
+        $files->expects('getRequire')->with($compiled, [])->throws(new FileNotFoundException(
+            "File does not exist at path {$path}."
+        ));
+
+        $engine->getCompiler()->expects('isExpired')->returns(true);
+
+        $engine->getCompiler()
+            ->expects('compile')
+            ->with($path);
+
+        $engine->getCompiler()->expects('getCompiledPath')->with($path)->returns($compiled);
+
+        $this->expectExceptionObject(new ViewException("File does not exist at path {$path}."));
+        $engine->get($path);
+    }
+
+    protected function getEngine($filesystem = null)
+    {
+        return new CompilerEngine(Double::for(CompilerInterface::class), $filesystem ?: new Filesystem);
+    }
+}

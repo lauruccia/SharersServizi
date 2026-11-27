@@ -1,0 +1,39 @@
+<?php
+
+namespace Illuminate\Tests\View\Blade;
+
+use Illuminate\Container\Container;
+use Illuminate\Filesystem\Filesystem;
+use Illuminate\View\Compilers\BladeCompiler;
+use Illuminate\View\Component;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PHPUnit\Framework\TestCase;
+
+abstract class AbstractBladeTestCase extends TestCase
+{
+    use VerifiesDoubles;
+
+    /**
+     * @var \Illuminate\View\Compilers\BladeCompiler
+     */
+    protected $compiler;
+
+    protected function setUp(): void
+    {
+        $this->compiler = new BladeCompiler($this->getFiles(), __DIR__);
+    }
+
+    protected function tearDown(): void
+    {
+        Container::setInstance(null);
+        Component::flushCache();
+        Component::forgetComponentsResolver();
+        Component::forgetFactory();
+    }
+
+    protected function getFiles()
+    {
+        return Double::for(Filesystem::class);
+    }
+}

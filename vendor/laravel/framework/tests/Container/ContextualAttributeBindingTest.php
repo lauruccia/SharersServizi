@@ -1,0 +1,705 @@
+<?php
+
+namespace Illuminate\Tests\Container;
+
+use Attribute;
+use Illuminate\Auth\AuthManager;
+use Illuminate\Cache\CacheManager;
+use Illuminate\Cache\Repository as CacheRepository;
+use Illuminate\Config\Repository;
+use Illuminate\Container\Attributes\Auth;
+use Illuminate\Container\Attributes\Authenticated;
+use Illuminate\Container\Attributes\Cache;
+use Illuminate\Container\Attributes\Config;
+use Illuminate\Container\Attributes\Context;
+use Illuminate\Container\Attributes\CurrentUser;
+use Illuminate\Container\Attributes\Database;
+use Illuminate\Container\Attributes\Give;
+use Illuminate\Container\Attributes\Log;
+use Illuminate\Container\Attributes\RouteParameter;
+use Illuminate\Container\Attributes\Storage;
+use Illuminate\Container\Attributes\Tag;
+use Illuminate\Container\Container;
+use Illuminate\Container\RewindableGenerator;
+use Illuminate\Contracts\Auth\Authenticatable as AuthenticatableContract;
+use Illuminate\Contracts\Auth\Guard as GuardContract;
+use Illuminate\Contracts\Container\ContextualAttribute;
+use Illuminate\Contracts\Filesystem\Filesystem;
+use Illuminate\Database\Connection;
+use Illuminate\Database\DatabaseManager;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Filesystem\FilesystemManager;
+use Illuminate\Http\Request;
+use Illuminate\Log\Context\Repository as ContextRepository;
+use Illuminate\Log\LogManager;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PDO;
+use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
+use ReflectionParameter;
+
+class ContextualAttributeBindingTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    public function testDependencyCanBeResolvedFromAttributeBinding()
+    {
+        $container = new Container;
+
+        $container->bind(ContainerTestContract::class, fn (): ContainerTestImplB => new ContainerTestImplB);
+        $container->whenHasAttribute(ContainerTestAttributeThatResolvesContractImpl::class, function (ContainerTestAttributeThatResolvesContractImpl $attribute) {
+            return match ($attribute->name) {
+                'A' => new ContainerTestImplA,
+                'B' => new ContainerTestImplB
+            };
+        });
+
+        $classA = $container->make(ContainerTestHasAttributeThatResolvesToImplA::class);
+
+        $this->assertInstanceOf(ContainerTestHasAttributeThatResolvesToImplA::class, $classA);
+        $this->assertInstanceOf(ContainerTestImplA::class, $classA->property);
+
+        $classB = $container->make(ContainerTestHasAttributeThatResolvesToImplB::class);
+
+        $this->assertInstanceOf(ContainerTestHasAttributeThatResolvesToImplB::class, $classB);
+        $this->assertInstanceOf(ContainerTestImplB::class, $classB->property);
+    }
+
+    public function testSimpleDependencyCanBeResolvedCorrectlyFromGiveAttributeBinding()
+    {
+        $container = new Container;
+
+        $container->bind(ContainerTestContract::class, concrete: ContainerTestImplA::class);
+
+        $resolution = $container->make(GiveTestSimple::class);
+
+        $this->assertInstanceOf(SimpleDependency::class, $resolution->dependency);
+    }
+
+    public function testComplexDependencyCanBeResolvedCorrectlyFromGiveAttributeBinding()
+    {
+        $container = new Container;
+
+        $container->bind(ContainerTestContract::class, concrete: ContainerTestImplA::class);
+
+        $resolution = $container->make(GiveTestComplex::class);
+
+        $this->assertInstanceOf(ComplexDependency::class, $resolution->dependency);
+        $this->assertTrue($resolution->dependency->param);
+    }
+
+    public function testScalarDependencyCanBeResolvedFromAttributeBinding()
+    {
+        $container = new Container;
+        $container->singleton('config', fn () => new Repository([
+            'app' => [
+                'timezone' => 'Europe/Paris',
+            ],
+        ]));
+
+        $container->whenHasAttribute(ContainerTestConfigValue::class, function (ContainerTestConfigValue $attribute, Container $container) {
+            return $container->make('config')->get($attribute->key);
+        });
+
+        $class = $container->make(ContainerTestHasConfigValueProperty::class);
+
+        $this->assertInstanceOf(ContainerTestHasConfigValueProperty::class, $class);
+        $this->assertSame('Europe/Paris', $class->timezone);
+    }
+
+    public function testScalarDependencyCanBeResolvedFromAttributeResolveMethod()
+    {
+        $container = new Container;
+        $container->singleton('config', fn () => new Repository([
+            'app' => [
+                'env' => 'production',
+            ],
+        ]));
+
+        $class = $container->make(ContainerTestHasConfigValueWithResolveProperty::class);
+
+        $this->assertInstanceOf(ContainerTestHasConfigValueWithResolveProperty::class, $class);
+        $this->assertSame('production', $class->env);
+    }
+
+    public function testDependencyWithAfterCallbackAttributeCanBeResolved()
+    {
+        $container = new Container;
+
+        $class = $container->make(ContainerTestHasConfigValueWithResolvePropertyAndAfterCallback::class);
+
+        $this->assertSame('Developer', $class->person->role);
+    }
+
+    public function testAuthedAttribute()
+    {
+        $container = new Container;
+        $container->singleton('auth', function () {
+            $manager = Double::for(AuthManager::class);
+            $manager->expects('userResolver')->times(4)->returns(fn ($guard = null) => $manager->guard($guard)->user());
+            $manager->expects('guard')->with('foo')->resolves(function () {
+                $guard = Double::for(GuardContract::class);
+                $guard->expects('user')->returns(Double::for(AuthenticatableContract::class));
+
+                return $guard;
+            });
+            $manager->expects('guard')->with('bar')->resolves(function () {
+                $guard = Double::for(GuardContract::class);
+                $guard->expects('user')->returns(Double::for(AuthenticatableContract::class));
+
+                return $guard;
+            });
+            $manager->expects('guard')->with(AuthGuardUnitEnum::unit)->resolves(function () {
+                $guard = Double::for(GuardContract::class);
+                $guard->expects('user')->returns(Double::for(AuthenticatableContract::class));
+
+                return $guard;
+            });
+            $manager->expects('guard')->with(AuthGuardBackedEnum::Backed)->resolves(function () {
+                $guard = Double::for(GuardContract::class);
+                $guard->expects('user')->returns(Double::for(AuthenticatableContract::class));
+
+                return $guard;
+            });
+
+            return $manager;
+        });
+
+        $container->make(AuthedTest::class);
+    }
+
+    public function testCacheAttribute()
+    {
+        $container = new Container;
+        $container->singleton('cache', function () {
+            $manager = Double::for(CacheManager::class);
+            $manager->expects('store')->with('foo')->returns(Double::for(CacheRepository::class));
+            $manager->expects('store')->with('bar')->returns(Double::for(CacheRepository::class));
+            $manager->expects('store')->with(CacheStoreUnitEnum::unit)->returns(Double::for(CacheRepository::class));
+            $manager->expects('store')->with(CacheStoreBackedEnum::Backed)->returns(Double::for(CacheRepository::class));
+            $manager->expects('memo')->with('foo')->returns(Double::for(CacheRepository::class));
+            $manager->expects('memo')->with('bar')->returns(Double::for(CacheRepository::class));
+
+            return $manager;
+        });
+
+        $container->make(CacheTest::class);
+    }
+
+    public function testConfigAttribute()
+    {
+        $container = new Container;
+        $container->singleton('config', fn () => new Repository(['foo' => 'foo', 'bar' => 'bar']));
+
+        $resolved = $container->make(ConfigTest::class);
+
+        $this->assertSame('foo', $resolved->foo);
+        $this->assertSame('bar', $resolved->bar);
+    }
+
+    public function testDatabaseAttribute()
+    {
+        $container = new Container;
+        $container->singleton('db', function () {
+            $manager = Double::for(DatabaseManager::class);
+            $manager->expects('connection')->with('foo')->returns(new Connection(new PDO('sqlite::memory:')));
+            $manager->expects('connection')->with('bar')->returns(new Connection(new PDO('sqlite::memory:')));
+
+            return $manager;
+        });
+
+        $container->make(DatabaseTest::class);
+    }
+
+    public function testAuthAttribute()
+    {
+        $container = new Container; //
+        $container->singleton('auth', function () {
+            $manager = Double::for(AuthManager::class);
+            $manager->expects('guard')->with('foo')->returns(Double::for(GuardContract::class));
+            $manager->expects('guard')->with('bar')->returns(Double::for(GuardContract::class));
+            $manager->expects('guard')->with(AuthGuardUnitEnum::unit)->returns(Double::for(GuardContract::class));
+            $manager->expects('guard')->with(AuthGuardBackedEnum::Backed)->returns(Double::for(GuardContract::class));
+
+            return $manager;
+        });
+
+        $container->make(GuardTest::class);
+    }
+
+    public function testLogAttribute()
+    {
+        $container = new Container;
+        $container->singleton('log', function () {
+            $manager = Double::for(LogManager::class);
+            $manager->expects('channel')->with('foo')->returns(Double::for(LoggerInterface::class));
+            $manager->expects('channel')->with('bar')->returns(Double::for(LoggerInterface::class));
+
+            return $manager;
+        });
+
+        $container->make(LogTest::class);
+    }
+
+    public function testRouteParameterAttribute()
+    {
+        $container = new Container;
+        $container->singleton('request', function () {
+            $request = Double::for(Request::class, override: true);
+            $request->expects('route')->with('foo')->returns(Double::for(Model::class));
+            $request->expects('route')->with('bar')->returns('bar');
+
+            return $request->instance();
+        });
+
+        $container->make(RouteParameterTest::class);
+    }
+
+    public function testRouteParameterAttributeWithouthParameterName()
+    {
+        $container = new Container;
+        $container->singleton('request', function () {
+            $request = Double::for(Request::class, override: true);
+            $request->expects('route')->with('foo')->returns(Double::for(Model::class));
+            $request->expects('route')->with('bar')->returns('bar');
+
+            return $request->instance();
+        });
+
+        $container->make(RouteParameterTestWithoutParameterName::class);
+    }
+
+    public function testContextAttribute(): void
+    {
+        $container = new Container;
+
+        $container->singleton(ContextRepository::class, function () {
+            $context = new ContextRepository(new \Illuminate\Events\Dispatcher);
+            $context->add('foo', 'foo');
+
+            return $context;
+        });
+
+        $resolved = $container->make(ContextTest::class);
+
+        $this->assertSame('foo', $resolved->foo);
+    }
+
+    public function testContextAttributeInteractingWithHidden(): void
+    {
+        $container = new Container;
+
+        $container->singleton(ContextRepository::class, function () {
+            $context = Double::for(ContextRepository::class);
+            $context->expects('getHidden')->with('bar', null)->returns('bar');
+            $context->expects('get')->never();
+
+            return $context;
+        });
+
+        $container->make(ContextHiddenTest::class);
+    }
+
+    public function testStorageAttribute()
+    {
+        $container = new Container;
+        $container->singleton('filesystem', function () {
+            $manager = Double::for(FilesystemManager::class);
+            $manager->expects('disk')->with('foo')->returns(Double::for(Filesystem::class));
+            $manager->expects('disk')->with('bar')->returns(Double::for(Filesystem::class));
+            $manager->expects('disk')->with(StorageDiskUnitEnum::unit)->returns(Double::for(Filesystem::class));
+            $manager->expects('disk')->with(StorageDiskBackedEnum::Backed)->returns(Double::for(Filesystem::class));
+
+            return $manager;
+        });
+
+        $container->make(StorageTest::class);
+    }
+
+    public function testInjectionWithAttributeOnAppCall()
+    {
+        $container = new Container;
+
+        $person = $container->call(function (ContainerTestHasConfigValueWithResolvePropertyAndAfterCallback $hasAttribute) {
+            return $hasAttribute->person;
+        });
+
+        $this->assertSame('Taylor', $person->name);
+    }
+
+    public function testAttributeOnAppCall()
+    {
+        $container = new Container;
+        $container->singleton('config', fn () => new Repository([
+            'app' => [
+                'timezone' => 'Europe/Paris',
+                'locale' => null,
+            ],
+        ]));
+
+        $value = $container->call(function (#[Config('app.timezone')] string $value) {
+            return $value;
+        });
+
+        $this->assertSame('Europe/Paris', $value);
+
+        $value = $container->call(function (#[Config('app.locale')] ?string $value) {
+            return $value;
+        });
+
+        $this->assertNull($value);
+    }
+
+    public function testNestedAttributeOnAppCall()
+    {
+        $container = new Container;
+        $container->singleton('config', fn () => new Repository([
+            'app' => [
+                'timezone' => 'Europe/Paris',
+                'locale' => null,
+            ],
+        ]));
+
+        $value = $container->call(function (TimezoneObject $object) {
+            return $object;
+        });
+
+        $this->assertSame('Europe/Paris', $value->timezone);
+
+        $value = $container->call(function (LocaleObject $object) {
+            return $object;
+        });
+
+        $this->assertNull($value->locale);
+    }
+
+    public function testTagAttribute()
+    {
+        $container = new Container;
+        $container->bind('one', fn (): int => 1);
+        $container->bind('two', fn (): int => 2);
+        $container->tag(['one', 'two'], 'numbers');
+
+        $value = $container->call(function (#[Tag('numbers')] RewindableGenerator $integers) {
+            return $integers;
+        });
+
+        $this->assertEquals([1, 2], iterator_to_array($value));
+    }
+
+    public function testParameterIsPassedToContextualAttributeResolver()
+    {
+        $container = new Container;
+
+        $value = $container->make(HasParameterAwareAttribute::class);
+
+        $this->assertSame('name', $value->name);
+    }
+
+    public function testParameterIsPassedToContextualAttributeResolverOnAppCall()
+    {
+        $container = new Container;
+
+        $value = $container->call(function (
+            #[ContainerTestParameterAwareAttribute] ?string $name
+        ) {
+            return $name;
+        });
+
+        $this->assertSame('name', $value);
+    }
+}
+
+#[Attribute(Attribute::TARGET_PARAMETER)]
+class ContainerTestAttributeThatResolvesContractImpl implements ContextualAttribute
+{
+    public function __construct(
+        public readonly string $name
+    ) {
+    }
+}
+
+enum StorageDiskUnitEnum
+{
+    case unit;
+}
+
+enum StorageDiskBackedEnum: string
+{
+    case Backed = 'backed';
+}
+
+enum AuthGuardUnitEnum
+{
+    case unit;
+}
+
+enum AuthGuardBackedEnum: string
+{
+    case Backed = 'backed';
+}
+
+enum CacheStoreUnitEnum
+{
+    case unit;
+}
+
+enum CacheStoreBackedEnum: string
+{
+    case Backed = 'backed';
+}
+
+interface ContainerTestContract
+{
+}
+
+final class ContainerTestImplA implements ContainerTestContract
+{
+}
+
+final class ContainerTestImplB implements ContainerTestContract
+{
+}
+
+final readonly class ContainerTestHasAttributeThatResolvesToImplA
+{
+    public function __construct(
+        #[ContainerTestAttributeThatResolvesContractImpl('A')]
+        public ContainerTestContract $property
+    ) {
+    }
+}
+
+final readonly class ContainerTestHasAttributeThatResolvesToImplB
+{
+    public function __construct(
+        #[ContainerTestAttributeThatResolvesContractImpl('B')]
+        public ContainerTestContract $property
+    ) {
+    }
+}
+
+#[Attribute(Attribute::TARGET_PARAMETER)]
+final readonly class ContainerTestConfigValue implements ContextualAttribute
+{
+    public function __construct(
+        public string $key
+    ) {
+    }
+}
+
+final class ContainerTestHasConfigValueProperty
+{
+    public function __construct(
+        #[ContainerTestConfigValue('app.timezone')]
+        public string $timezone
+    ) {
+    }
+}
+
+#[Attribute(Attribute::TARGET_PARAMETER)]
+final readonly class ContainerTestConfigValueWithResolve implements ContextualAttribute
+{
+    public function __construct(
+        public string $key
+    ) {
+    }
+
+    public function resolve(self $attribute, Container $container): string
+    {
+        return $container->make('config')->get($attribute->key);
+    }
+}
+
+final class ContainerTestHasConfigValueWithResolveProperty
+{
+    public function __construct(
+        #[ContainerTestConfigValueWithResolve('app.env')]
+        public string $env
+    ) {
+    }
+}
+
+#[Attribute(Attribute::TARGET_PARAMETER)]
+final class ContainerTestConfigValueWithResolveAndAfter implements ContextualAttribute
+{
+    public function resolve(self $attribute, Container $container): object
+    {
+        return (object) ['name' => 'Taylor'];
+    }
+
+    public function after(self $attribute, object $value, Container $container): void
+    {
+        $value->role = 'Developer';
+    }
+}
+
+#[Attribute(Attribute::TARGET_PARAMETER)]
+final class ContainerTestParameterAwareAttribute implements ContextualAttribute
+{
+    public function resolve(self $attribute, Container $container, ReflectionParameter $parameter): string
+    {
+        return $parameter->getName();
+    }
+}
+
+final class ContainerTestHasConfigValueWithResolvePropertyAndAfterCallback
+{
+    public function __construct(
+        #[ContainerTestConfigValueWithResolveAndAfter]
+        public object $person
+    ) {
+    }
+}
+
+final class SimpleDependency implements ContainerTestContract
+{
+}
+
+final class ComplexDependency implements ContainerTestContract
+{
+    public function __construct(public bool $param)
+    {
+    }
+}
+
+final readonly class AuthedTest
+{
+    public function __construct(
+        #[Authenticated('foo')] AuthenticatableContract $foo,
+        #[CurrentUser('bar')] AuthenticatableContract $bar,
+        #[Authenticated(AuthGuardUnitEnum::unit)] AuthenticatableContract $unit,
+        #[CurrentUser(AuthGuardBackedEnum::Backed)] AuthenticatableContract $backed,
+    ) {
+    }
+}
+
+final readonly class CacheTest
+{
+    public function __construct(
+        #[Cache('foo')] CacheRepository $foo,
+        #[Cache('bar')] CacheRepository $bar,
+        #[Cache(CacheStoreUnitEnum::unit)] CacheRepository $unit,
+        #[Cache(CacheStoreBackedEnum::Backed)] CacheRepository $backed,
+        #[Cache('foo', memo: true)] CacheRepository $fooMemoized,
+        #[Cache('bar', memo: true)] CacheRepository $barMemoized,
+    ) {
+    }
+}
+
+final readonly class ConfigTest
+{
+    public function __construct(#[Config('foo')] public string $foo, #[Config('bar')] public string $bar)
+    {
+    }
+}
+
+final readonly class ContextTest
+{
+    public function __construct(#[Context('foo')] public string $foo)
+    {
+    }
+}
+
+final readonly class ContextHiddenTest
+{
+    public function __construct(#[Context('bar', hidden: true)] string $foo)
+    {
+    }
+}
+
+final readonly class DatabaseTest
+{
+    public function __construct(#[Database('foo')] Connection $foo, #[Database('bar')] Connection $bar)
+    {
+    }
+}
+
+final readonly class GuardTest
+{
+    public function __construct(
+        #[Auth('foo')] GuardContract $foo,
+        #[Auth('bar')] GuardContract $bar,
+        #[Auth(AuthGuardUnitEnum::unit)] GuardContract $unit,
+        #[Auth(AuthGuardBackedEnum::Backed)] GuardContract $backed,
+    ) {
+    }
+}
+
+final readonly class LogTest
+{
+    public function __construct(#[Log('foo')] LoggerInterface $foo, #[Log('bar')] LoggerInterface $bar)
+    {
+    }
+}
+
+final readonly class RouteParameterTest
+{
+    public function __construct(#[RouteParameter('foo')] Model $foo, #[RouteParameter('bar')] string $bar)
+    {
+    }
+}
+
+final readonly class RouteParameterTestWithoutParameterName
+{
+    public function __construct(#[RouteParameter] Model $foo, #[RouteParameter] string $bar)
+    {
+    }
+}
+
+final readonly class StorageTest
+{
+    public function __construct(
+        #[Storage('foo')] Filesystem $foo,
+        #[Storage('bar')] Filesystem $bar,
+        #[Storage(StorageDiskUnitEnum::unit)] Filesystem $unit,
+        #[Storage(StorageDiskBackedEnum::Backed)] Filesystem $backed,
+    ) {
+    }
+}
+
+final readonly class GiveTestSimple
+{
+    public function __construct(
+        #[Give(SimpleDependency::class)]
+        public ContainerTestContract $dependency
+    ) {
+    }
+}
+
+final readonly class GiveTestComplex
+{
+    public function __construct(
+        #[Give(ComplexDependency::class, ['param' => true])]
+        public ContainerTestContract $dependency
+    ) {
+    }
+}
+
+final readonly class TimezoneObject
+{
+    public function __construct(
+        #[Config('app.timezone')] public ?string $timezone
+    ) {
+        //
+    }
+}
+
+final readonly class LocaleObject
+{
+    public function __construct(
+        #[Config('app.locale')] public ?string $locale
+    ) {
+        //
+    }
+}
+
+final readonly class HasParameterAwareAttribute
+{
+    public function __construct(
+        #[ContainerTestParameterAwareAttribute] public ?string $name,
+    ) {
+        //
+    }
+}

@@ -1,0 +1,170 @@
+<?php
+
+namespace Illuminate\Tests\Testing\Concerns;
+
+use Illuminate\Database\Connection;
+use Illuminate\Database\ConnectionResolver;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Foundation\Testing\Concerns\InteractsWithDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Facade;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PDO;
+use PHPUnit\Framework\TestCase;
+
+class InteractsWithDatabaseTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    protected function setUp(): void
+    {
+        Facade::clearResolvedInstances();
+        Facade::setFacadeApplication(null);
+    }
+
+    public function testCastToJsonSqlite()
+    {
+        $grammar = 'SQLite';
+
+        $this->assertEquals(<<<'TEXT'
+        '["foo","bar"]'
+        TEXT,
+            $this->castAsJson(['foo', 'bar'], $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        '["foo","bar"]'
+        TEXT,
+            $this->castAsJson(collect(['foo', 'bar']), $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        '{"foo":"bar"}'
+        TEXT,
+            $this->castAsJson((object) ['foo' => 'bar'], $grammar)
+        );
+    }
+
+    public function testCastToJsonPostgres()
+    {
+        $grammar = 'Postgres';
+
+        $this->assertEquals(<<<'TEXT'
+        '["foo","bar"]'
+        TEXT,
+            $this->castAsJson(['foo', 'bar'], $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        '["foo","bar"]'
+        TEXT,
+            $this->castAsJson(collect(['foo', 'bar']), $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        '{"foo":"bar"}'
+        TEXT,
+            $this->castAsJson((object) ['foo' => 'bar'], $grammar)
+        );
+    }
+
+    public function testCastToJsonSqlServer()
+    {
+        $grammar = 'SqlServer';
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('["foo","bar"]')
+        TEXT,
+            $this->castAsJson(['foo', 'bar'], $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('["foo","bar"]')
+        TEXT,
+            $this->castAsJson(collect(['foo', 'bar']), $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('{"foo":"bar"}')
+        TEXT,
+            $this->castAsJson((object) ['foo' => 'bar'], $grammar)
+        );
+    }
+
+    public function testCastToJsonMySql()
+    {
+        $grammar = 'MySql';
+
+        $this->assertEquals(<<<'TEXT'
+        cast('["foo","bar"]' as json)
+        TEXT,
+            $this->castAsJson(['foo', 'bar'], $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        cast('["foo","bar"]' as json)
+        TEXT,
+            $this->castAsJson(collect(['foo', 'bar']), $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        cast('{"foo":"bar"}' as json)
+        TEXT,
+            $this->castAsJson((object) ['foo' => 'bar'], $grammar)
+        );
+    }
+
+    public function testCastToJsonMariaDb()
+    {
+        $grammar = 'MariaDb';
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('["foo","bar"]', '$')
+        TEXT,
+            $this->castAsJson(['foo', 'bar'], $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('["foo","bar"]', '$')
+        TEXT,
+            $this->castAsJson(collect(['foo', 'bar']), $grammar)
+        );
+
+        $this->assertEquals(<<<'TEXT'
+        json_query('{"foo":"bar"}', '$')
+        TEXT,
+            $this->castAsJson((object) ['foo' => 'bar'], $grammar)
+        );
+    }
+
+    protected function castAsJson($value, $grammar)
+    {
+        $connection = Double::for(Connection::class);
+        $grammarClass = 'Illuminate\Database\Query\Grammars\\'.$grammar.'Grammar';
+        $grammar = new $grammarClass($connection);
+
+        $connection->allows('getQueryGrammar')->returns($grammar);
+
+        $connection->allows('raw')->resolves(function ($value) {
+            return new Expression($value);
+        });
+
+        $pdo = Double::for(PDO::class);
+        $pdo->allows('quote')->resolves(function ($value) {
+            return "'".$value."'";
+        });
+        $connection->allows('getPdo')->returns($pdo);
+
+        $resolver = new ConnectionResolver(['default' => $connection]);
+        $resolver->setDefaultConnection('default');
+        DB::swap($resolver);
+
+        $instance = new class
+        {
+            use InteractsWithDatabase;
+        };
+
+        return $instance->castAsJson($value)->getValue($grammar);
+    }
+}

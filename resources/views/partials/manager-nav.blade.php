@@ -1,0 +1,12 @@
+<a href="{{ route('manager.requests') }}">Richieste</a>
+<a href="{{ route('manager.registries') }}">Anagrafiche</a>
+<a href="{{ route('manager.orders') }}">Ordini</a>
+<a href="{{ route('manager.promos') }}">Promo Dedicate</a>
+<a href="{{ route('manager.network') }}">Rete</a>
+<a href="{{ route('manager.directory') }}">Elenchi</a>
+<a href="{{ route('production.index') }}">Produzione</a>
+<a href="{{ route('manager.production.import') }}">Import</a>
+<a href="{{ route('manager.plan') }}">Compensi</a>
+<a href="{{ route('contests.index') }}">Gare</a>
+<a href="{{ route('manager.tickets') }}">Segnalazioni</a>
+<a href="{{ route('manager.content') }}">Materiali e FAQ</a>

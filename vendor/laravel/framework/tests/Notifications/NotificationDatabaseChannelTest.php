@@ -1,0 +1,114 @@
+<?php
+
+namespace Illuminate\Tests\Notifications;
+
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Notifications\AnonymousNotifiable;
+use Illuminate\Notifications\Channels\DatabaseChannel;
+use Illuminate\Notifications\Messages\DatabaseMessage;
+use Illuminate\Notifications\Notification;
+use Illuminate\Support\Carbon;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PHPUnit\Framework\TestCase;
+
+class NotificationDatabaseChannelTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    public function testDatabaseChannelCreatesDatabaseRecordWithProperData()
+    {
+        $notification = new NotificationDatabaseChannelTestNotification;
+        $notification->id = 1;
+        $notifiable = Double::for(AnonymousNotifiable::class);
+
+        $notifiable->expects('routeNotificationFor')->returns($relation = Double::for(HasMany::class));
+        $relation->expects('create')->with([
+            'id' => 1,
+            'type' => get_class($notification),
+            'data' => ['invoice_id' => 1],
+            'read_at' => null,
+        ]);
+
+        $channel = new DatabaseChannel;
+        $channel->send($notifiable, $notification);
+    }
+
+    public function testCorrectPayloadIsSentToDatabase()
+    {
+        $notification = new NotificationDatabaseChannelTestNotification;
+        $notification->id = 1;
+        $notifiable = Double::for(AnonymousNotifiable::class);
+
+        $notifiable->expects('routeNotificationFor')->returns($relation = Double::for(HasMany::class));
+        $relation->expects('create')->with([
+            'id' => 1,
+            'type' => get_class($notification),
+            'data' => ['invoice_id' => 1],
+            'read_at' => null,
+            'something' => 'else',
+        ]);
+
+        $channel = new ExtendedDatabaseChannel;
+        $channel->send($notifiable, $notification);
+    }
+
+    public function testCustomizeTypeIsSentToDatabase()
+    {
+        Carbon::setTestNow(Carbon::now());
+
+        $notification = new NotificationDatabaseChannelCustomizeTypeTestNotification;
+        $notification->id = 1;
+        $notifiable = Double::for(AnonymousNotifiable::class);
+
+        $notifiable->expects('routeNotificationFor')->returns($relation = Double::for(HasMany::class));
+        $relation->expects('create')->with([
+            'id' => 1,
+            'type' => 'MONTHLY',
+            'data' => ['invoice_id' => 1],
+            'read_at' => Carbon::now(),
+            'something' => 'else',
+        ]);
+
+        $channel = new ExtendedDatabaseChannel;
+        $channel->send($notifiable, $notification);
+
+        Carbon::setTestNow();
+    }
+}
+
+class NotificationDatabaseChannelTestNotification extends Notification
+{
+    public function toDatabase($notifiable)
+    {
+        return new DatabaseMessage(['invoice_id' => 1]);
+    }
+}
+
+class NotificationDatabaseChannelCustomizeTypeTestNotification extends Notification
+{
+    public function toDatabase($notifiable)
+    {
+        return new DatabaseMessage(['invoice_id' => 1]);
+    }
+
+    public function databaseType()
+    {
+        return 'MONTHLY';
+    }
+
+    public function initialDatabaseReadAtValue()
+    {
+        return Carbon::now();
+    }
+}
+
+class ExtendedDatabaseChannel extends DatabaseChannel
+{
+    protected function buildPayload($notifiable, Notification $notification)
+    {
+        return array_merge(parent::buildPayload($notifiable, $notification), [
+            'something' => 'else',
+        ]);
+    }
+}

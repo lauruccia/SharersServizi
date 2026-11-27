@@ -1,0 +1,997 @@
+<?php
+
+namespace Illuminate\Tests\Integration\Queue;
+
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Events\Dispatcher as EventsDispatcher;
+use Illuminate\Foundation\Testing\Concerns\InteractsWithRedis;
+use Illuminate\Queue\Attributes\Delay;
+use Illuminate\Queue\Events\JobQueued;
+use Illuminate\Queue\Events\JobQueueing;
+use Illuminate\Queue\Jobs\InspectedJob;
+use Illuminate\Queue\Jobs\RedisJob;
+use Illuminate\Queue\LuaScripts;
+use Illuminate\Queue\Queue;
+use Illuminate\Queue\RedisQueue;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\InteractsWithTime;
+use Illuminate\Support\Str;
+use JMac\Testing\Double;
+use JMac\Testing\DoubleInterface;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use JMac\Testing\Matching\Argument;
+use Orchestra\Testbench\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+
+#[RequiresPhpExtension('redis')]
+class RedisQueueTest extends TestCase
+{
+    use InteractsWithRedis, InteractsWithTime;
+    use VerifiesDoubles;
+
+    /**
+     * @var \Illuminate\Queue\RedisQueue
+     */
+    private $queue;
+
+    /**
+     * @var DoubleInterface
+     */
+    private $container;
+
+    protected function setUp(): void
+    {
+        $this->afterApplicationCreated(function () {
+            $this->setUpRedis();
+        });
+
+        $this->beforeApplicationDestroyed(function () {
+            $this->tearDownRedis();
+        });
+
+        parent::setUp();
+    }
+
+    /**
+     * @param  string  $driver
+     * @param  string  $default
+     * @param  string|null  $connection
+     * @param  int  $retryAfter
+     * @param  int|null  $blockFor
+     */
+    private function setQueue($driver, $default = 'default', $connection = null, $retryAfter = 60, $blockFor = null)
+    {
+        $this->queue = new RedisQueue($this->redis[$driver], $default, $connection, $retryAfter, $blockFor);
+        $this->container = Double::for(Container::class, override: true);
+        $this->queue->setContainer($this->container->instance());
+    }
+
+    private function getQueueRedisKey($queue = null)
+    {
+        return (new \ReflectionMethod($this->queue, 'getQueueRedisKey'))->invoke($this->queue, $queue);
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testExpiredJobsArePopped($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $jobs = [
+            new RedisQueueIntegrationTestJob(0),
+            new RedisQueueIntegrationTestJob(1),
+            new RedisQueueIntegrationTestJob(2),
+            new RedisQueueIntegrationTestJob(3),
+        ];
+
+        $this->queue->later(1000, $jobs[0]);
+        $this->queue->later(-200, $jobs[1]);
+        $this->queue->later(-300, $jobs[2]);
+        $this->queue->later(-100, $jobs[3]);
+
+        $this->assertEquals($jobs[2], unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $this->assertEquals($jobs[1], unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $this->assertEquals($jobs[3], unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $this->assertNull($this->queue->pop());
+
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+        $this->assertEquals(3, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+    }
+
+    /**
+     * @param  mixed  $driver
+     *
+     * @throws \Exception
+     */
+    #[DataProvider('redisDriverProvider')]
+    #[RequiresPhpExtension('pcntl')]
+    public function testBlockingPop($driver)
+    {
+        $this->tearDownRedis();
+
+        $default = config('queue.connections.redis.queue', 'default');
+        if ($pid = pcntl_fork() > 0) {
+            $this->setUpRedis();
+            $this->setQueue($driver, $default, null, 60, 10);
+            $this->assertEquals(12, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command)->i);
+        } elseif ($pid == 0) {
+            $this->setUpRedis();
+            $this->setQueue('phpredis', $default);
+            sleep(1);
+            $this->queue->push(new RedisQueueIntegrationTestJob(12));
+            exit;
+        } else {
+            $this->fail('Cannot fork');
+        }
+    }
+
+    // /**
+    //  * @param  string  $driver
+    //  */
+    // #[DataProvider('redisDriverProvider')]
+    // public function testMigrateMoreThan100Jobs($driver)
+    // {
+    //     $default = config('queue.connections.redis.queue', 'default');
+    //     $this->setQueue($driver, $default);
+    //     for ($i = -1; $i >= -201; $i--) {
+    //         $this->queue->later($i, new RedisQueueIntegrationTestJob($i));
+    //     }
+    //     for ($i = -201; $i <= -1; $i++) {
+    //         $this->assertEquals($i, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command)->i);
+    //         $this->assertEquals(-$i - 1, $this->redis[$driver]->llen("queues:$default:notify"));
+    //     }
+    // }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testPopProperlyPopsJobOffOfRedis($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->push($job);
+
+        // Pop and check it is popped correctly
+        $before = $this->currentTime();
+        /** @var \Illuminate\Queue\Jobs\RedisJob $redisJob */
+        $redisJob = $this->queue->pop();
+        $after = $this->currentTime();
+
+        $this->assertEquals($job, unserialize(json_decode($redisJob->getRawBody())->data->command));
+        $this->assertEquals(1, $redisJob->attempts());
+        $this->assertEquals($job, unserialize(json_decode($redisJob->getReservedJob())->data->command));
+        $this->assertEquals(1, json_decode($redisJob->getReservedJob())->attempts);
+        $this->assertEquals($redisJob->getJobId(), json_decode($redisJob->getReservedJob())->id);
+
+        // Check reserved queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $result = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:reserved", -INF, INF, ['withscores' => true]);
+        $reservedJob = array_keys($result)[0];
+        $score = (int) $result[$reservedJob];
+        $this->assertLessThanOrEqual($score, $before + 60);
+        $this->assertGreaterThanOrEqual($score, $after + 60);
+        $this->assertEquals($job, unserialize(json_decode($reservedJob)->data->command));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testPopProperlyPopsDelayedJobOffOfRedis($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->later(-10, $job);
+
+        // Pop and check it is popped correctly
+        $before = $this->currentTime();
+        $this->assertEquals($job, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $after = $this->currentTime();
+
+        // Check reserved queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $result = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:reserved", -INF, INF, ['withscores' => true]);
+        $reservedJob = array_keys($result)[0];
+        $score = (int) $result[$reservedJob];
+        $this->assertLessThanOrEqual($score, $before + 60);
+        $this->assertGreaterThanOrEqual($score, $after + 60);
+        $this->assertEquals($job, unserialize(json_decode($reservedJob)->data->command));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testPopPopsDelayedJobOffOfRedisWhenExpireNull($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default, null, null);
+
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->later(-10, $job);
+
+        $this->container->received('bound')->with('events')->times(2);
+
+        // Pop and check it is popped correctly
+        $before = $this->currentTime();
+        $this->assertEquals($job, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $after = $this->currentTime();
+
+        // Check reserved queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $result = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:reserved", -INF, INF, ['withscores' => true]);
+        $reservedJob = array_keys($result)[0];
+        $score = (int) $result[$reservedJob];
+        $this->assertLessThanOrEqual($score, $before);
+        $this->assertGreaterThanOrEqual($score, $after);
+        $this->assertEquals($job, unserialize(json_decode($reservedJob)->data->command));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testBlockingPopProperlyPopsJobOffOfRedis($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default, null, 60, 5);
+
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->push($job);
+
+        // Pop and check it is popped correctly
+        /** @var \Illuminate\Queue\Jobs\RedisJob $redisJob */
+        $redisJob = $this->queue->pop();
+
+        $this->assertNotNull($redisJob);
+        $this->assertEquals($job, unserialize(json_decode($redisJob->getReservedJob())->data->command));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testBlockingPopProperlyPopsExpiredJobs($driver)
+    {
+        Str::createUuidsUsing(function () {
+            return 'uuid';
+        });
+
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default, null, 60, 5);
+
+        $jobs = [
+            new RedisQueueIntegrationTestJob(0),
+            new RedisQueueIntegrationTestJob(1),
+        ];
+
+        $this->queue->later(-200, $jobs[0]);
+        $this->queue->later(-200, $jobs[1]);
+
+        $this->assertEquals($jobs[0], unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $this->assertEquals($jobs[1], unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(0, $this->redis[$driver]->connection()->llen("$redisKey:notify"));
+        $this->assertEquals(0, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+        $this->assertEquals(2, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+
+        Str::createUuidsNormally();
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testNotExpireJobsWhenExpireNull($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default, null, null);
+
+        // Make an expired reserved job
+        $failed = new RedisQueueIntegrationTestJob(-20);
+        $this->queue->push($failed);
+
+        $beforeFailPop = $this->currentTime();
+        $this->queue->pop();
+        $afterFailPop = $this->currentTime();
+
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->push($job);
+        $this->container->received('bound')->with('events')->times(4);
+
+        // Pop and check it is popped correctly
+        $before = $this->currentTime();
+        $this->assertEquals($job, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $after = $this->currentTime();
+
+        // Check reserved queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(2, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $result = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:reserved", -INF, INF, ['withscores' => true]);
+
+        foreach ($result as $payload => $score) {
+            $command = unserialize(json_decode($payload)->data->command);
+            $this->assertInstanceOf(RedisQueueIntegrationTestJob::class, $command);
+            $this->assertContains($command->i, [10, -20]);
+
+            $score = (int) $score;
+
+            if ($command->i == 10) {
+                $this->assertLessThanOrEqual($score, $before);
+                $this->assertGreaterThanOrEqual($score, $after);
+            } else {
+                $this->assertLessThanOrEqual($score, $beforeFailPop);
+                $this->assertGreaterThanOrEqual($score, $afterFailPop);
+            }
+        }
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testExpireJobsWhenExpireSet($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default, null, 30);
+
+        // Push an item into queue
+        $job = new RedisQueueIntegrationTestJob(10);
+        $this->queue->push($job);
+        $this->container->received('bound')->with('events')->times(2);
+
+        // Pop and check it is popped correctly
+        $before = $this->currentTime();
+        $this->assertEquals($job, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $after = $this->currentTime();
+
+        // Check reserved queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $result = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:reserved", -INF, INF, ['withscores' => true]);
+        $reservedJob = array_keys($result)[0];
+        $score = (int) $result[$reservedJob];
+        $this->assertLessThanOrEqual($score, $before + 30);
+        $this->assertGreaterThanOrEqual($score, $after + 30);
+        $this->assertEquals($job, unserialize(json_decode($reservedJob)->data->command));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testRelease($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        // push a job into queue
+        $job = new RedisQueueIntegrationTestJob(30);
+        $this->queue->push($job);
+
+        // pop and release the job
+        /** @var \Illuminate\Queue\Jobs\RedisJob $redisJob */
+        $redisJob = $this->queue->pop();
+        $before = $this->currentTime();
+        $redisJob->release(1000);
+        $after = $this->currentTime();
+
+        // check the content of delayed queue
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+
+        $results = $this->redis[$driver]->connection()->zrangebyscore("$redisKey:delayed", -INF, INF, ['withscores' => true]);
+
+        $payload = array_keys($results)[0];
+
+        $score = $results[$payload];
+
+        $this->assertGreaterThanOrEqual($before + 1000, $score);
+        $this->assertLessThanOrEqual($after + 1000, $score);
+
+        $decoded = json_decode($payload);
+
+        $this->assertEquals(1, $decoded->attempts);
+        $this->assertEquals($job, unserialize($decoded->data->command));
+
+        // check if the queue has no ready item yet
+        $this->assertNull($this->queue->pop());
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testReleaseInThePast($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+        $job = new RedisQueueIntegrationTestJob(30);
+        $this->queue->push($job);
+
+        /** @var \Illuminate\Queue\Jobs\RedisJob $redisJob */
+        $redisJob = $this->queue->pop();
+        $redisJob->release(-3);
+
+        $this->assertInstanceOf(RedisJob::class, $this->queue->pop());
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testDelete($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $job = new RedisQueueIntegrationTestJob(30);
+        $this->queue->push($job);
+
+        /** @var \Illuminate\Queue\Jobs\RedisJob $redisJob */
+        $redisJob = $this->queue->pop();
+
+        $redisJob->delete();
+
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(0, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+        $this->assertEquals(0, $this->redis[$driver]->connection()->zcard("$redisKey:reserved"));
+        $this->assertEquals(0, $this->redis[$driver]->connection()->llen("$redisKey"));
+
+        $this->assertNull($this->queue->pop());
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testClear($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $job1 = new RedisQueueIntegrationTestJob(30);
+        $job2 = new RedisQueueIntegrationTestJob(40);
+
+        $this->queue->push($job1);
+        $this->queue->push($job2);
+
+        $this->assertEquals(2, $this->queue->clear(null));
+        $this->assertEquals(0, $this->queue->size());
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(0, $this->redis[$driver]->connection()->llen("$redisKey:notify"));
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testSize($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+        $this->assertEquals(0, $this->queue->size());
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->assertEquals(1, $this->queue->size());
+        $this->queue->later(60, new RedisQueueIntegrationTestJob(2));
+        $this->assertEquals(2, $this->queue->size());
+        $this->queue->push(new RedisQueueIntegrationTestJob(3));
+        $this->assertEquals(3, $this->queue->size());
+        $job = $this->queue->pop();
+        $this->assertEquals(3, $this->queue->size());
+        $job->delete();
+        $this->assertEquals(2, $this->queue->size());
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testPushJobQueueingAndJobQueuedEvents($driver)
+    {
+        $dispatched = [];
+
+        $events = new EventsDispatcher;
+        $events->listen([JobQueueing::class, JobQueued::class], function ($event) use (&$dispatched) {
+            $dispatched[] = $event;
+        });
+
+        $container = new Container;
+        $container->instance('events', $events);
+
+        $default = config('queue.connections.redis.queue', 'default');
+        $queue = new RedisQueue($this->redis[$driver], $default);
+        $queue->setContainer($container);
+
+        $queue->push($job = new RedisQueueIntegrationTestJob(5));
+
+        $this->assertCount(2, $dispatched);
+        $this->assertInstanceOf(JobQueueing::class, $dispatched[0]);
+        $this->assertSame($job, $dispatched[0]->job);
+        $this->assertInstanceOf(JobQueued::class, $dispatched[1]);
+        $this->assertSame($job, $dispatched[1]->job);
+        $this->assertIsString($dispatched[1]->id);
+    }
+
+    /**
+     * @param  string  $driver
+     */
+    #[DataProvider('redisDriverProvider')]
+    public function testBulkJobQueuedEvent($driver)
+    {
+        $events = Double::for(Dispatcher::class);
+        $events->expects('dispatch')->with(Argument::type(JobQueueing::class))->returns(null)->times(3);
+        $events->expects('dispatch')->with(Argument::type(JobQueued::class))->returns(null)->times(3);
+
+        $container = Double::for(Container::class, override: true);
+        $container->expects('bound')->with('events')->returns(true)->times(6);
+        $container->expects('offsetGet')->with('events')->returns($events)->times(6);
+
+        $default = config('queue.connections.redis.queue', 'default');
+        $queue = new RedisQueue($this->redis[$driver], $default);
+        $queue->setContainer($container->instance());
+
+        $queue->bulk([
+            new RedisQueueIntegrationTestJob(5),
+            new RedisQueueIntegrationTestJob(10),
+            new RedisQueueIntegrationTestJob(15),
+        ]);
+    }
+
+    /**
+     * Test that delayed jobs work correctly with phpredis when serialization is enabled.
+     *
+     * This test reproduces issue #58214 where delayed jobs don't work when using
+     * phpredis with serialization/compression enabled because the laterRaw method
+     * uses zadd directly (which triggers phpredis serialization) instead of a Lua
+     * script (which bypasses serialization like pushRaw does).
+     */
+    public function testDelayedJobsWorkWithPhpRedisSerializationEnabled(): void
+    {
+        // Get the phpredis connection and enable serialization
+        $connection = $this->redis['phpredis']->connection();
+        $client = $connection->client();
+
+        // Redis::OPT_SERIALIZER = 1, Redis::SERIALIZER_PHP = 1
+        $optSerializer = 1;
+        $serializerPhp = 1;
+
+        // Store original serializer to restore later
+        $originalSerializer = $client->getOption($optSerializer);
+
+        // Enable PHP serialization (simulates real-world usage with serialization)
+        $client->setOption($optSerializer, $serializerPhp);
+
+        try {
+            $default = config('queue.connections.redis.queue', 'default');
+            $this->setQueue('phpredis', $default);
+
+            // Push a delayed job (this is where the bug occurs - zadd serializes the payload)
+            $job = new RedisQueueIntegrationTestJob(42);
+            $this->queue->later(-10, $job);
+
+            // The job should be immediately available since we used a negative delay
+            // With the bug, this would fail because the payload is double-serialized
+            $poppedJob = $this->queue->pop();
+
+            $this->assertNotNull($poppedJob, 'Delayed job should be retrievable after delay expires');
+
+            // Verify the job payload can be decoded correctly
+            $rawBody = $poppedJob->getRawBody();
+            $decoded = json_decode($rawBody);
+
+            $this->assertNotNull($decoded, 'Job payload should be valid JSON');
+            $this->assertObjectHasProperty('data', $decoded, 'Decoded payload should have data property');
+
+            // Verify the actual job data
+            $command = unserialize($decoded->data->command);
+            $this->assertEquals($job, $command, 'Unserialized job should match original');
+            $this->assertEquals(42, $command->i, 'Job property should be preserved');
+        } finally {
+            // Restore original serializer setting
+            $client->setOption($optSerializer, $originalSerializer);
+        }
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testPendingJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $job = new RedisQueueIntegrationTestJob(99);
+        $this->queue->push($job);
+
+        $pending = $this->queue->pendingJobs();
+
+        $this->assertCount(1, $pending);
+        $this->assertInstanceOf(InspectedJob::class, $pending->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $pending->first()->name);
+        $this->assertSame(0, $pending->first()->attempts);
+        $this->assertNotNull($pending->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $pending->first()->createdAt);
+        $this->assertSame($default, $pending->first()->queue);
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testDelayedJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $job = new RedisQueueIntegrationTestJob(99);
+        $this->queue->later(60, $job);
+
+        $delayed = $this->queue->delayedJobs();
+
+        $this->assertCount(1, $delayed);
+        $this->assertInstanceOf(InspectedJob::class, $delayed->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $delayed->first()->name);
+        $this->assertSame(0, $delayed->first()->attempts);
+        $this->assertNotNull($delayed->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $delayed->first()->createdAt);
+        $this->assertSame($default, $delayed->first()->queue);
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testReservedJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $job = new RedisQueueIntegrationTestJob(99);
+        $this->queue->push($job);
+        $this->queue->pop(); // moves job to reserved sorted set
+
+        $reserved = $this->queue->reservedJobs();
+
+        $this->assertCount(1, $reserved);
+        $this->assertInstanceOf(InspectedJob::class, $reserved->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $reserved->first()->name);
+        $this->assertSame(1, $reserved->first()->attempts);
+        $this->assertNotNull($reserved->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $reserved->first()->createdAt);
+        $this->assertSame($default, $reserved->first()->queue);
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testAllPendingJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+
+        $pending = $this->queue->allPendingJobs();
+
+        $this->assertCount(2, $pending);
+        $this->assertInstanceOf(InspectedJob::class, $pending->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $pending->first()->name);
+        $this->assertSame(0, $pending->first()->attempts);
+        $this->assertNotNull($pending->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $pending->first()->createdAt);
+        $this->assertSame([$default, 'emails'], $pending->pluck('queue')->sort()->values()->all());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testAllDelayedJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $this->queue->later(60, new RedisQueueIntegrationTestJob(1));
+        $this->queue->laterOn('emails', 60, new RedisQueueIntegrationTestJob(2));
+
+        $delayed = $this->queue->allDelayedJobs();
+
+        $this->assertCount(2, $delayed);
+        $this->assertInstanceOf(InspectedJob::class, $delayed->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $delayed->first()->name);
+        $this->assertSame(0, $delayed->first()->attempts);
+        $this->assertNotNull($delayed->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $delayed->first()->createdAt);
+        $this->assertSame([$default, 'emails'], $delayed->pluck('queue')->sort()->values()->all());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testAllReservedJobs($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+        $this->queue->pop();
+        $this->queue->pop('emails');
+
+        $reserved = $this->queue->allReservedJobs();
+
+        $this->assertCount(2, $reserved);
+        $this->assertInstanceOf(InspectedJob::class, $reserved->first());
+        $this->assertSame(RedisQueueIntegrationTestJob::class, $reserved->first()->name);
+        $this->assertSame(1, $reserved->first()->attempts);
+        $this->assertNotNull($reserved->first()->uuid);
+        $this->assertInstanceOf(Carbon::class, $reserved->first()->createdAt);
+        $this->assertSame([$default, 'emails'], $reserved->pluck('queue')->sort()->values()->all());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testTotalSize($driver)
+    {
+        $this->setQueue($driver, config('queue.connections.redis.queue', 'default'));
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+        $this->queue->later(60, new RedisQueueIntegrationTestJob(3));
+
+        $this->assertSame(3, $this->queue->totalSize());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testTotalPendingSize($driver)
+    {
+        $this->setQueue($driver, config('queue.connections.redis.queue', 'default'));
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+
+        $this->assertSame(2, $this->queue->totalPendingSize());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testTotalDelayedSize($driver)
+    {
+        $this->setQueue($driver, config('queue.connections.redis.queue', 'default'));
+
+        $this->queue->later(60, new RedisQueueIntegrationTestJob(1));
+        $this->queue->laterOn('emails', 60, new RedisQueueIntegrationTestJob(2));
+
+        $this->assertSame(2, $this->queue->totalDelayedSize());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testTotalReservedSize($driver)
+    {
+        $this->setQueue($driver, config('queue.connections.redis.queue', 'default'));
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+        $this->queue->pop();
+        $this->queue->pop('emails');
+
+        $this->assertSame(2, $this->queue->totalReservedSize());
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testBulkPushesAllJobsOntoQueue($driver)
+    {
+        $this->setQueue($driver, 'default');
+
+        $this->queue->bulk([
+            new RedisQueueIntegrationTestJob(1),
+            new RedisQueueIntegrationTestJob(2),
+            new RedisQueueIntegrationTestJob(3),
+        ], '', 'bulk-test');
+
+        $this->assertSame(3, $this->queue->size('bulk-test'));
+
+        $seen = [];
+
+        for ($i = 0; $i < 3; $i++) {
+            $seen[] = unserialize(json_decode($this->queue->pop('bulk-test')->getRawBody())->data->command)->i;
+        }
+
+        sort($seen);
+
+        $this->assertSame([1, 2, 3], $seen);
+        $this->assertNull($this->queue->pop('bulk-test'));
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testPayloadHooksAreAppliedToTheQueuedPayload($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $receivedQueue = null;
+
+        Queue::createPayloadUsing(function ($connection, $queue, $payload) use (&$receivedQueue) {
+            $receivedQueue = $queue;
+
+            return ['custom' => 'taylor'];
+        });
+
+        Queue::createPayloadUsing(function ($connection, $queue, $payload) {
+            return ['bar' => 'foo'];
+        });
+
+        try {
+            $this->queue->push('foo', ['data']);
+        } finally {
+            Queue::createPayloadUsing(null);
+        }
+
+        $payload = json_decode($this->queue->pop()->getRawBody(), true);
+
+        $this->assertSame('foo', $payload['job']);
+        $this->assertSame(['data'], $payload['data']);
+        $this->assertSame('taylor', $payload['custom']);
+        $this->assertSame('foo', $payload['bar']);
+
+        // The hook sees the queue name as configured, without any cluster hash tags...
+        $this->assertSame('queues:'.$default, $receivedQueue);
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testLaterAcceptsADateTimeDelay($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $due = new RedisQueueIntegrationTestJob(1);
+        $notDue = new RedisQueueIntegrationTestJob(2);
+
+        $this->queue->later(Carbon::now()->subSeconds(100), $due);
+        $this->queue->later(Carbon::now()->addSeconds(1000), $notDue);
+
+        $this->assertEquals($due, unserialize(json_decode($this->queue->pop()->getRawBody())->data->command));
+        $this->assertNull($this->queue->pop());
+
+        $redisKey = $this->getQueueRedisKey($default);
+        $this->assertEquals(1, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testQueueNamesCanBeEnums($driver)
+    {
+        $this->setQueue($driver, 'default');
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1), '', 'emails');
+        $this->queue->push(new RedisQueueIntegrationTestJob(2), '', 'emails');
+        $this->queue->push(new RedisQueueIntegrationTestJob(3), '', 'other');
+
+        $this->assertSame(2, $this->queue->size(RedisQueueIntegrationTestQueue::Emails));
+        $this->assertSame(2, $this->queue->pendingJobs(RedisQueueIntegrationTestQueue::Emails)->count());
+        $this->assertSame('emails', $this->queue->pendingJobs(RedisQueueIntegrationTestQueue::Emails)->first()->queue);
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testBulkPushesDelayedJobsOntoDelayedQueue($driver)
+    {
+        $this->setQueue($driver, 'default');
+
+        $this->queue->bulk([
+            new RedisQueueIntegrationTestJob(1),
+            new RedisQueueIntegrationTestDelayedJob(2),
+        ], '', 'bulk-delay');
+
+        $redisKey = $this->getQueueRedisKey('bulk-delay');
+
+        $this->assertSame(1, $this->redis[$driver]->connection()->llen($redisKey));
+        $this->assertSame(1, $this->redis[$driver]->connection()->zcard("$redisKey:delayed"));
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testBulkPushesManyJobsOntoQueue($driver)
+    {
+        $this->setQueue($driver, 'default');
+
+        $jobs = [];
+
+        for ($i = 0; $i < 1050; $i++) {
+            $jobs[] = new RedisQueueIntegrationTestJob($i);
+        }
+
+        $this->queue->bulk($jobs, '', 'bulk-many');
+
+        $redisKey = $this->getQueueRedisKey('bulk-many');
+
+        $this->assertSame(1050, $this->queue->size('bulk-many'));
+        $this->assertSame(1050, $this->redis[$driver]->connection()->llen("$redisKey:notify"));
+    }
+
+    #[DataProvider('bulkPushNotificationCountProvider')]
+    public function testBulkPushScriptCreatesOneNotificationPerJob(int $count)
+    {
+        $connection = $this->redis['phpredis']->connection();
+        $key = "queues:{bulk-script-{$count}}";
+        $payloads = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $payloads[] = "job-{$i}";
+        }
+
+        $connection->eval(LuaScripts::bulkPush(), 2, $key, "{$key}:notify", ...$payloads);
+
+        $this->assertSame($payloads, $connection->lrange($key, 0, -1));
+        $this->assertSame(array_fill(0, $count, '1'), $connection->lrange("{$key}:notify", 0, -1));
+    }
+
+    public static function bulkPushNotificationCountProvider(): array
+    {
+        return [
+            'empty' => [0],
+            'single' => [1],
+            'before chunk boundary' => [99],
+            'at chunk boundary' => [100],
+            'after chunk boundary' => [101],
+            'multiple chunks' => [250],
+            'full bulk' => [1000],
+        ];
+    }
+
+    #[DataProvider('redisDriverProvider')]
+    public function testAllQueueNamesReturnsQueuesAcrossMultipleQueues($driver)
+    {
+        $default = config('queue.connections.redis.queue', 'default');
+        $this->setQueue($driver, $default);
+
+        $this->queue->push(new RedisQueueIntegrationTestJob(1));
+        $this->queue->pushOn('emails', new RedisQueueIntegrationTestJob(2));
+        $this->queue->pushOn('notifications', new RedisQueueIntegrationTestJob(3));
+
+        $names = (new \ReflectionMethod($this->queue, 'allQueueNames'))
+            ->invoke($this->queue)
+            ->sort()
+            ->values()
+            ->all();
+
+        $this->assertSame([$default, 'emails', 'notifications'], $names);
+    }
+}
+
+class RedisQueueIntegrationTestJob
+{
+    public $i;
+
+    public function __construct($i)
+    {
+        $this->i = $i;
+    }
+
+    public function handle()
+    {
+        //
+    }
+}
+
+#[Delay(60)]
+class RedisQueueIntegrationTestDelayedJob
+{
+    public $i;
+
+    public function __construct($i)
+    {
+        $this->i = $i;
+    }
+
+    public function handle()
+    {
+        //
+    }
+}
+
+enum RedisQueueIntegrationTestQueue: string
+{
+    case Emails = 'emails';
+}

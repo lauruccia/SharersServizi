@@ -1,0 +1,489 @@
+<?php
+
+namespace Illuminate\Tests\Foundation\Configuration;
+
+use Illuminate\Auth\AuthenticationException;
+use Illuminate\Auth\Middleware\Authenticate;
+use Illuminate\Auth\Middleware\RedirectIfAuthenticated;
+use Illuminate\Container\Container;
+use Illuminate\Cookie\Middleware\EncryptCookies;
+use Illuminate\Encryption\Encrypter;
+use Illuminate\Foundation\Application as FoundationApplication;
+use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Foundation\Http\Middleware\ConvertEmptyStringsToNull;
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
+use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
+use Illuminate\Foundation\Http\Middleware\TrimStrings;
+use Illuminate\Http\Middleware\TrustHosts;
+use Illuminate\Http\Middleware\TrustProxies;
+use Illuminate\Http\Request;
+use Illuminate\Session\Middleware\AuthenticateSession;
+use Illuminate\Session\Middleware\StartSession;
+use PHPUnit\Framework\TestCase;
+use ReflectionClass;
+use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
+
+class MiddlewareTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        Container::setInstance(null);
+        ConvertEmptyStringsToNull::flushState();
+        EncryptCookies::flushState();
+        PreventRequestForgery::flushState();
+        PreventRequestsDuringMaintenance::flushState();
+        TrimStrings::flushState();
+        TrustProxies::flushState();
+
+        foreach ([Authenticate::class, AuthenticateSession::class, AuthenticationException::class, RedirectIfAuthenticated::class] as $class) {
+            (new ReflectionClass($class))->getProperty('redirectToCallback')->setValue(null, null);
+        }
+    }
+
+    public function testConvertEmptyStringsToNull()
+    {
+        $configuration = new Middleware();
+        $middleware = new ConvertEmptyStringsToNull();
+
+        $configuration->convertEmptyStringsToNull(except: [
+            fn (Request $request) => $request->has('skip-all-1'),
+            fn (Request $request) => $request->has('skip-all-2'),
+        ]);
+
+        $symfonyRequest = new SymfonyRequest([
+            'aaa' => '  123  ',
+            'bbb' => '',
+        ]);
+
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $request = Request::createFromBase($symfonyRequest);
+
+        $request = $middleware->handle($request, fn (Request $request) => $request);
+
+        $this->assertSame('  123  ', $request->get('aaa'));
+        $this->assertNull($request->get('bbb'));
+
+        $symfonyRequest = new SymfonyRequest([
+            'aaa' => '  123  ',
+            'bbb' => '',
+            'skip-all-1' => 'true',
+        ]);
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $request = Request::createFromBase($symfonyRequest);
+
+        $request = $middleware->handle($request, fn (Request $request) => $request);
+
+        $this->assertSame('  123  ', $request->get('aaa'));
+        $this->assertSame('', $request->get('bbb'));
+
+        $symfonyRequest = new SymfonyRequest([
+            'aaa' => '  123  ',
+            'bbb' => '',
+            'skip-all-2' => 'true',
+        ]);
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $request = Request::createFromBase($symfonyRequest);
+
+        $request = $middleware->handle($request, fn (Request $request) => $request);
+
+        $this->assertSame('  123  ', $request->get('aaa'));
+        $this->assertSame('', $request->get('bbb'));
+    }
+
+    public function testTrimStrings()
+    {
+        $configuration = new Middleware();
+        $middleware = new TrimStrings();
+
+        $configuration->trimStrings(except: [
+            'aaa',
+            fn (Request $request) => $request->has('skip-all'),
+        ]);
+
+        $symfonyRequest = new SymfonyRequest([
+            'aaa' => '  123  ',
+            'bbb' => '  456  ',
+            'ccc' => '  789  ',
+        ]);
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $request = Request::createFromBase($symfonyRequest);
+
+        $request = $middleware->handle($request, fn (Request $request) => $request);
+
+        $this->assertSame('  123  ', $request->get('aaa'));
+        $this->assertSame('456', $request->get('bbb'));
+        $this->assertSame('789', $request->get('ccc'));
+
+        $symfonyRequest = new SymfonyRequest([
+            'aaa' => '  123  ',
+            'bbb' => '  456  ',
+            'ccc' => '  789  ',
+            'skip-all' => true,
+        ]);
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $request = Request::createFromBase($symfonyRequest);
+
+        $request = $middleware->handle($request, fn (Request $request) => $request);
+
+        $this->assertSame('  123  ', $request->get('aaa'));
+        $this->assertSame('  456  ', $request->get('bbb'));
+        $this->assertSame('  789  ', $request->get('ccc'));
+    }
+
+    public function testTrustProxies()
+    {
+        $configuration = new Middleware();
+        $middleware = new TrustProxies;
+
+        $reflection = new ReflectionClass($middleware);
+        $method = $reflection->getMethod('proxies');
+        $property = $reflection->getProperty('proxies');
+
+        $this->assertNull($method->invoke($middleware));
+
+        $property->setValue($middleware, [
+            '192.168.1.1',
+            '192.168.1.2',
+        ]);
+
+        $this->assertEquals([
+            '192.168.1.1',
+            '192.168.1.2',
+        ], $method->invoke($middleware));
+
+        $configuration->trustProxies(at: '*');
+        $this->assertSame('*', $method->invoke($middleware));
+
+        $configuration->trustProxies(at: [
+            '192.168.1.3',
+            '192.168.1.4',
+        ]);
+        $this->assertEquals([
+            '192.168.1.3',
+            '192.168.1.4',
+        ], $method->invoke($middleware));
+    }
+
+    public function testTrustHeaders()
+    {
+        $configuration = new Middleware();
+        $middleware = new TrustProxies;
+
+        $reflection = new ReflectionClass($middleware);
+        $method = $reflection->getMethod('headers');
+        $property = $reflection->getProperty('headers');
+
+        $this->assertEquals(Request::HEADER_X_FORWARDED_FOR |
+            Request::HEADER_X_FORWARDED_HOST |
+            Request::HEADER_X_FORWARDED_PORT |
+            Request::HEADER_X_FORWARDED_PROTO |
+            Request::HEADER_X_FORWARDED_PREFIX |
+            Request::HEADER_X_FORWARDED_AWS_ELB, $method->invoke($middleware));
+
+        $property->setValue($middleware, Request::HEADER_X_FORWARDED_AWS_ELB);
+
+        $this->assertEquals(Request::HEADER_X_FORWARDED_AWS_ELB, $method->invoke($middleware));
+
+        $configuration->trustProxies(headers: Request::HEADER_X_FORWARDED_FOR);
+
+        $this->assertEquals(Request::HEADER_X_FORWARDED_FOR, $method->invoke($middleware));
+
+        $configuration->trustProxies([
+            '192.168.1.3',
+            '192.168.1.4',
+        ], Request::HEADER_X_FORWARDED_FOR |
+            Request::HEADER_X_FORWARDED_HOST |
+            Request::HEADER_X_FORWARDED_PORT
+        );
+
+        $this->assertEquals(Request::HEADER_X_FORWARDED_FOR |
+            Request::HEADER_X_FORWARDED_HOST |
+            Request::HEADER_X_FORWARDED_PORT, $method->invoke($middleware));
+    }
+
+    public function testTrustHosts()
+    {
+        $app = new FoundationApplication;
+        $configuration = new Middleware();
+        $middleware = new class($app) extends TrustHosts
+        {
+            protected function allSubdomainsOfApplicationUrl()
+            {
+                return '^(.+\.)?laravel\.test$';
+            }
+        };
+
+        $this->assertEquals(['^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts();
+        $this->assertEquals(['^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts(at: ['my.test']);
+        $this->assertEquals(['my.test', '^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts(at: static fn () => ['my.test']);
+        $this->assertEquals(['my.test', '^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts(at: ['my.test'], subdomains: false);
+        $this->assertEquals(['my.test'], $middleware->hosts());
+
+        $configuration->trustHosts(at: static fn () => ['my.test'], subdomains: false);
+        $this->assertEquals(['my.test'], $middleware->hosts());
+
+        $configuration->trustHosts(at: []);
+        $this->assertEquals(['^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts(at: static fn () => []);
+        $this->assertEquals(['^(.+\.)?laravel\.test$'], $middleware->hosts());
+
+        $configuration->trustHosts(at: [], subdomains: false);
+        $this->assertSame([], $middleware->hosts());
+
+        $configuration->trustHosts(at: static fn () => [], subdomains: false);
+        $this->assertSame([], $middleware->hosts());
+    }
+
+    public function testEncryptCookies()
+    {
+        $configuration = new Middleware();
+        $encrypter = new Encrypter(str_repeat('a', 16));
+        $middleware = new EncryptCookies($encrypter);
+
+        $this->assertFalse($middleware->isDisabled('aaa'));
+        $this->assertFalse($middleware->isDisabled('bbb'));
+
+        $configuration->encryptCookies(except: [
+            'aaa',
+            'bbb',
+        ]);
+
+        $this->assertTrue($middleware->isDisabled('aaa'));
+        $this->assertTrue($middleware->isDisabled('bbb'));
+    }
+
+    public function testPreventRequestsDuringMaintenance()
+    {
+        $configuration = new Middleware();
+
+        $app = new FoundationApplication;
+        $middleware = new PreventRequestsDuringMaintenance($app);
+
+        $reflection = new ReflectionClass($middleware);
+        $method = $reflection->getMethod('inExceptArray');
+
+        $symfonyRequest = new SymfonyRequest();
+        $symfonyRequest->server->set('REQUEST_METHOD', 'GET');
+        $symfonyRequest->server->set('REQUEST_URI', 'metrics/requests');
+
+        $request = Request::createFromBase($symfonyRequest);
+        $this->assertFalse($method->invoke($middleware, $request));
+
+        $configuration->preventRequestsDuringMaintenance(['metrics/*']);
+        $this->assertTrue($method->invoke($middleware, $request));
+    }
+
+    public function testPreventRequestForgery()
+    {
+        $configuration = new Middleware();
+        $middleware = new PreventRequestForgery(
+            new FoundationApplication,
+            new Encrypter(str_repeat('a', 16))
+        );
+
+        $this->assertSame([], $middleware->getExcludedPaths());
+
+        $configuration->preventRequestForgery(
+            except: ['/webhook', '/api/*'],
+            originOnly: true,
+            allowSameSite: true
+        );
+
+        $this->assertSame(['/webhook', '/api/*'], $middleware->getExcludedPaths());
+
+        $reflection = new ReflectionClass(PreventRequestForgery::class);
+        $this->assertTrue($reflection->getStaticPropertyValue('originOnly'));
+        $this->assertTrue($reflection->getStaticPropertyValue('allowSameSite'));
+    }
+
+    public function testRedirectUsersToDoesNotOverwriteRedirectGuestsTo()
+    {
+        $middleware = new Middleware;
+
+        $middleware->redirectGuestsTo(fn () => '/login');
+        $middleware->redirectUsersTo('/dashboard');
+
+        $authenticateCallback = (new ReflectionClass(Authenticate::class))
+            ->getProperty('redirectToCallback')->getValue();
+        $sessionCallback = (new ReflectionClass(AuthenticateSession::class))
+            ->getProperty('redirectToCallback')->getValue();
+        $exceptionCallback = (new ReflectionClass(AuthenticationException::class))
+            ->getProperty('redirectToCallback')->getValue();
+        $usersCallback = (new ReflectionClass(RedirectIfAuthenticated::class))
+            ->getProperty('redirectToCallback')->getValue();
+
+        $this->assertSame('/login', $authenticateCallback(null));
+        $this->assertSame('/login', $sessionCallback(null));
+        $this->assertSame('/login', $exceptionCallback(null));
+        $this->assertSame('/dashboard', $usersCallback(null));
+    }
+
+    public function testRedirectGuestsToNullRegistersNullCallback()
+    {
+        $middleware = new Middleware;
+
+        $middleware->redirectGuestsTo(null);
+
+        $callback = (new ReflectionClass(Authenticate::class))
+            ->getProperty('redirectToCallback')->getValue();
+
+        $this->assertNotNull($callback);
+        $this->assertNull($callback(null));
+    }
+
+    public function testReplace()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->replace('FirstMiddleware', 'ReplacedMiddleware');
+
+        $this->assertSame(['ReplacedMiddleware', 'SecondMiddleware'], $middleware->getGlobalMiddleware());
+    }
+
+    public function testReplaceWithArray()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware', 'SecondMiddleware', 'ThirdMiddleware']);
+        $middleware->replace('FirstMiddleware', ['FirstMiddleware', 'AfterMiddleware']);
+        $middleware->replace('ThirdMiddleware', ['BeforeMiddleware', 'ThirdMiddleware']);
+
+        $this->assertSame([
+            'FirstMiddleware',
+            'AfterMiddleware',
+            'SecondMiddleware',
+            'BeforeMiddleware',
+            'ThirdMiddleware',
+        ], $middleware->getGlobalMiddleware());
+    }
+
+    public function testReplaceDefaultMiddlewareWithArray()
+    {
+        $middleware = new Middleware;
+
+        $middleware->replace(TrustProxies::class, [TrustProxies::class, 'AfterMiddleware']);
+
+        $global = $middleware->getGlobalMiddleware();
+
+        $this->assertSame('AfterMiddleware', $global[array_search(TrustProxies::class, $global) + 1]);
+    }
+
+    public function testReplaceMissingMiddlewareWithArray()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware']);
+        $middleware->replace('MissingMiddleware', ['MissingMiddleware', 'AfterMiddleware']);
+
+        $this->assertSame(['FirstMiddleware'], $middleware->getGlobalMiddleware());
+    }
+
+    public function testRemoveReplacedMiddleware()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->replace('FirstMiddleware', ['FirstMiddleware', 'AfterMiddleware']);
+        $middleware->remove('FirstMiddleware');
+
+        $this->assertSame(['AfterMiddleware', 'SecondMiddleware'], $middleware->getGlobalMiddleware());
+    }
+
+    public function testReplaceInGroup()
+    {
+        $middleware = new Middleware;
+
+        $middleware->group('custom', ['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->replaceInGroup('custom', 'FirstMiddleware', 'ReplacedMiddleware');
+
+        $this->assertSame(['ReplacedMiddleware', 'SecondMiddleware'], $middleware->getMiddlewareGroups()['custom']);
+    }
+
+    public function testReplaceInGroupWithArray()
+    {
+        $middleware = new Middleware;
+
+        $middleware->group('custom', ['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->replaceInGroup('custom', 'FirstMiddleware', ['BeforeMiddleware', 'FirstMiddleware', 'AfterMiddleware']);
+
+        $this->assertSame([
+            'BeforeMiddleware',
+            'FirstMiddleware',
+            'AfterMiddleware',
+            'SecondMiddleware',
+        ], $middleware->getMiddlewareGroups()['custom']);
+    }
+
+    public function testReplaceInWebGroupWithArray()
+    {
+        $middleware = new Middleware;
+
+        $middleware->web(replace: [
+            StartSession::class => [StartSession::class, 'AfterMiddleware'],
+        ]);
+
+        $web = $middleware->getMiddlewareGroups()['web'];
+
+        $this->assertSame('AfterMiddleware', $web[array_search(StartSession::class, $web) + 1]);
+    }
+
+    public function testInsertBefore()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->insertBefore('SecondMiddleware', ['BeforeMiddleware', 'AnotherBeforeMiddleware']);
+
+        $this->assertSame([
+            'FirstMiddleware',
+            'BeforeMiddleware',
+            'AnotherBeforeMiddleware',
+            'SecondMiddleware',
+        ], $middleware->getGlobalMiddleware());
+    }
+
+    public function testInsertAfter()
+    {
+        $middleware = new Middleware;
+
+        $middleware->use(['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->insertAfter('FirstMiddleware', 'AfterMiddleware');
+
+        $this->assertSame(['FirstMiddleware', 'AfterMiddleware', 'SecondMiddleware'], $middleware->getGlobalMiddleware());
+    }
+
+    public function testInsertBeforeInGroup()
+    {
+        $middleware = new Middleware;
+
+        $middleware->group('custom', ['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->insertBeforeInGroup('custom', 'SecondMiddleware', ['BeforeMiddleware', 'AnotherBeforeMiddleware']);
+
+        $this->assertSame([
+            'FirstMiddleware',
+            'BeforeMiddleware',
+            'AnotherBeforeMiddleware',
+            'SecondMiddleware',
+        ], $middleware->getMiddlewareGroups()['custom']);
+    }
+
+    public function testInsertAfterInGroup()
+    {
+        $middleware = new Middleware;
+
+        $middleware->group('custom', ['FirstMiddleware', 'SecondMiddleware']);
+        $middleware->insertAfterInGroup('custom', 'FirstMiddleware', 'AfterMiddleware');
+
+        $this->assertSame(['FirstMiddleware', 'AfterMiddleware', 'SecondMiddleware'], $middleware->getMiddlewareGroups()['custom']);
+    }
+}

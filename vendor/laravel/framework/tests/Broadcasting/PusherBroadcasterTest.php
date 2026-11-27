@@ -1,0 +1,230 @@
+<?php
+
+namespace Illuminate\Tests\Broadcasting;
+
+use Illuminate\Broadcasting\Broadcasters\PusherBroadcaster;
+use Illuminate\Http\Request;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PHPUnit\Framework\TestCase;
+use Pusher\Pusher;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+
+require_once __DIR__.'/Fixtures/PusherStub.php';
+
+class PusherBroadcasterTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    /**
+     * @var \Illuminate\Broadcasting\Broadcasters\PusherBroadcaster
+     */
+    public $broadcaster;
+
+    public $pusher;
+
+    protected function setUp(): void
+    {
+        $this->pusher = Double::for(Pusher::class);
+        $this->broadcaster = new PusherBroadcaster($this->pusher->instance());
+    }
+
+    public function testAuthCallValidAuthenticationResponseWithPrivateChannelWhenCallbackReturnTrue()
+    {
+        $this->broadcaster->channel('test', function () {
+            return true;
+        });
+
+        $data = ['auth' => 'abcd:efgh'];
+
+        $this->pusher->expects('socket_auth')->with('private-test', 'abcd.1234')->returns(json_encode($data));
+
+        $this->assertEquals($data, $this->broadcaster->auth(
+            $this->getMockRequestWithUserForChannel('private-test')
+        ));
+    }
+
+    public function testAuthThrowAccessDeniedHttpExceptionWithPrivateChannelWhenCallbackReturnFalse()
+    {
+        $this->expectException(AccessDeniedHttpException::class);
+
+        $this->broadcaster->channel('test', function () {
+            return false;
+        });
+
+        $this->broadcaster->auth(
+            $this->getMockRequestWithUserForChannel('private-test')
+        );
+    }
+
+    public function testAuthRejectsArrayChannelName()
+    {
+        $this->expectException(AccessDeniedHttpException::class);
+
+        $request = $this->getMockRequestWithUserForChannel(
+            ['private-test']
+        );
+
+        $this->broadcaster->auth($request);
+    }
+
+    public function testAuthThrowAccessDeniedHttpExceptionWithPrivateChannelWhenRequestUserNotFound()
+    {
+        $this->expectException(AccessDeniedHttpException::class);
+
+        $this->broadcaster->channel('test', function () {
+            return true;
+        });
+
+        $this->broadcaster->auth(
+            $this->getMockRequestWithoutUserForChannel('private-test')
+        );
+    }
+
+    public function testAuthCallValidAuthenticationResponseWithPresenceChannelWhenCallbackReturnAnArray()
+    {
+        $returnData = [1, 2, 3, 4];
+        $this->broadcaster->channel('test', function () use ($returnData) {
+            return $returnData;
+        });
+
+        $data = ['auth' => 'abcd:efgh', 'channel_data' => ['user_id' => 42, 'user_info' => $returnData]];
+
+        $this->pusher->expects('presence_auth')->with('presence-test', 'abcd.1234', 42, $returnData)->returns(json_encode($data));
+
+        $this->assertEquals($data, $this->broadcaster->auth(
+            $this->getMockRequestWithUserForChannel('presence-test')
+        ));
+    }
+
+    public function testAuthThrowAccessDeniedHttpExceptionWithPresenceChannelWhenCallbackReturnNull()
+    {
+        $this->expectException(AccessDeniedHttpException::class);
+
+        $this->broadcaster->channel('test', function () {
+            //
+        });
+
+        $this->broadcaster->auth(
+            $this->getMockRequestWithUserForChannel('presence-test')
+        );
+    }
+
+    public function testAuthThrowAccessDeniedHttpExceptionWithPresenceChannelWhenRequestUserNotFound()
+    {
+        $this->expectException(AccessDeniedHttpException::class);
+
+        $this->broadcaster->channel('test', function () {
+            return [1, 2, 3, 4];
+        });
+
+        $this->broadcaster->auth(
+            $this->getMockRequestWithoutUserForChannel('presence-test')
+        );
+    }
+
+    public function testBroadcastTriggersEncryptedChannelsSeparately()
+    {
+        $this->pusher->expects('trigger')->with(['private-a', 'b'], 'event', ['foo' => 'bar'], []);
+        $this->pusher->expects('trigger')->with(['private-encrypted-c'], 'event', ['foo' => 'bar'], []);
+        $this->pusher->expects('trigger')->with(['private-encrypted-d'], 'event', ['foo' => 'bar'], []);
+
+        $this->broadcaster->broadcast(
+            ['private-a', 'private-encrypted-c', 'b', 'private-encrypted-d'], 'event', ['foo' => 'bar']
+        );
+    }
+
+    public function testValidAuthenticationResponseCallPusherSocketAuthMethodWithPrivateChannel()
+    {
+        $request = $this->getMockRequestWithUserForChannel('private-test');
+
+        $data = [
+            'auth' => 'abcd:efgh',
+        ];
+
+        $this->pusher->expects('socket_auth')->returns(json_encode($data));
+
+        $this->assertEquals(
+            $data,
+            $this->broadcaster->validAuthenticationResponse($request, true)
+        );
+    }
+
+    public function testValidAuthenticationResponseCallPusherPresenceAuthMethodWithPresenceChannel()
+    {
+        $request = $this->getMockRequestWithUserForChannel('presence-test');
+
+        $data = [
+            'auth' => 'abcd:efgh',
+            'channel_data' => [
+                'user_id' => 42,
+                'user_info' => [1, 2, 3, 4],
+            ],
+        ];
+
+        $this->pusher->expects('presence_auth')->returns(json_encode($data));
+
+        $this->assertEquals(
+            $data,
+            $this->broadcaster->validAuthenticationResponse($request, true)
+        );
+    }
+
+    public function testUserAuthenticationForPusher()
+    {
+        $this->pusher->expects('getSettings')->returns([
+            'auth_key' => '278d425bdf160c739803',
+            'secret' => '7ad3773142a6692b25b8',
+        ]);
+
+        $this->broadcaster = new PusherBroadcaster($this->pusher->instance());
+
+        $this->broadcaster->resolveAuthenticatedUserUsing(function () {
+            return ['id' => '12345'];
+        });
+
+        $response = $this->broadcaster->resolveAuthenticatedUser(new Request(['socket_id' => '1234.1234']));
+
+        // The result is hard-coded from the Pusher docs
+        // See: https://pusher.com/docs/channels/library_auth_reference/auth-signatures/#user-authentication
+        $this->assertSame([
+            'auth' => '278d425bdf160c739803:4708d583dada6a56435fb8bc611c77c359a31eebde13337c16ab43aa6de336ba',
+            'user_data' => json_encode(['id' => '12345']),
+        ], $response);
+    }
+
+    /**
+     * @param  string  $channel
+     * @return \Illuminate\Http\Request
+     */
+    protected function getMockRequestWithUserForChannel($channel)
+    {
+        $request = Request::create('/', 'POST', ['channel_name' => $channel, 'socket_id' => 'abcd.1234']);
+
+        $user = new class
+        {
+            public function getAuthIdentifierForBroadcasting()
+            {
+                return 42;
+            }
+
+            public function getAuthIdentifier()
+            {
+                return 42;
+            }
+        };
+
+        $request->setUserResolver(fn () => $user);
+
+        return $request;
+    }
+
+    /**
+     * @param  string  $channel
+     * @return \Illuminate\Http\Request
+     */
+    protected function getMockRequestWithoutUserForChannel($channel)
+    {
+        return Request::create('/', 'POST', ['channel_name' => $channel]);
+    }
+}

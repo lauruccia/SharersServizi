@@ -1,0 +1,89 @@
+<?php
+
+namespace Illuminate\Tests\Support;
+
+use Exception;
+use Illuminate\Support\Timebox;
+use JMac\Testing\Double;
+use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;
+use PHPUnit\Framework\TestCase;
+
+class SupportTimeboxTest extends TestCase
+{
+    use VerifiesDoubles;
+
+    public function testMakeExecutesCallback()
+    {
+        $callback = function () {
+            $this->assertTrue(true);
+        };
+
+        (new Timebox)->call($callback, 0);
+    }
+
+    public function testMakeWaitsForMicroseconds()
+    {
+        $mock = Double::for(Timebox::class)->passthru();
+        $mock->expects('usleep');
+
+        $mock->call(function () {
+        }, 10000);
+
+        $mock->received('usleep')->times(1);
+    }
+
+    public function testMakeShouldNotSleepWhenEarlyReturnHasBeenFlagged()
+    {
+        $mock = Double::for(Timebox::class)->passthru();
+        $mock->call(function ($timebox) {
+            $timebox->returnEarly();
+        }, 10000);
+
+        $mock->received('usleep')->never();
+    }
+
+    public function testMakeShouldSleepWhenDontEarlyReturnHasBeenFlagged()
+    {
+        $mock = Double::for(Timebox::class)->passthru();
+        $mock->expects('usleep');
+
+        $mock->call(function ($timebox) {
+            $timebox->returnEarly();
+            $timebox->dontReturnEarly();
+        }, 10000);
+
+        $mock->received('usleep')->times(1);
+    }
+
+    public function testMakeWaitsForMicrosecondsWhenExceptionIsThrown()
+    {
+        $mock = Double::for(Timebox::class)->passthru();
+        $mock->expects('usleep');
+
+        try {
+            $this->expectExceptionObject(new Exception('Exception within Timebox callback.'));
+
+            $mock->call(function () {
+                throw new Exception('Exception within Timebox callback.');
+            }, 10000);
+        } finally {
+            $mock->received('usleep')->times(1);
+        }
+    }
+
+    public function testMakeShouldNotSleepWhenEarlyReturnHasBeenFlaggedAndExceptionIsThrown()
+    {
+        $mock = Double::for(Timebox::class)->passthru();
+
+        try {
+            $this->expectExceptionObject(new Exception('Exception within Timebox callback.'));
+
+            $mock->call(function ($timebox) {
+                $timebox->returnEarly();
+                throw new Exception('Exception within Timebox callback.');
+            }, 10000);
+        } finally {
+            $mock->received('usleep')->never();
+        }
+    }
+}
