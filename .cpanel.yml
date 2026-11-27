@@ -1,0 +1,6 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home/fpmaster/portale
+    - /bin/mkdir -p $DEPLOYPATH
+    - /usr/bin/rsync -a --exclude='.git' --exclude='.github' --exclude='/.env' --exclude='/.cpanel.yml' ./ $DEPLOYPATH/
