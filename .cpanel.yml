@@ -1,6 +1,10 @@
 ---
 deployment:
   tasks:
-    - export DEPLOYPATH=/home/fpmaster/portale
-    - /bin/mkdir -p $DEPLOYPATH
-    - /usr/bin/rsync -a --exclude='.git' --exclude='.github' --exclude='/.env' --exclude='/.cpanel.yml' ./ $DEPLOYPATH/
+    - export APPPATH=/home/fpmaster/portale
+    - export WEBPATH=/home/fpmaster/public_html
+    - /bin/mkdir -p $APPPATH
+    - /usr/bin/rsync -a --exclude='.git' --exclude='.github' --exclude='/.env' --exclude='/.cpanel.yml' --exclude='/public' --exclude='/deploy' ./ $APPPATH/
+    - /usr/bin/rsync -a --exclude='/index.php' --exclude='/.htaccess' ./public/ $WEBPATH/
+    - /usr/bin/rsync -a --ignore-existing ./public/.htaccess $WEBPATH/.htaccess
+    - /bin/cp deploy/index.php $WEBPATH/index.php
